@@ -88,6 +88,7 @@ def init_db() -> None:
             priority TEXT NOT NULL DEFAULT 'normal',
             completed INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'todo',
+            assignee_id TEXT,
             visibility TEXT NOT NULL DEFAULT 'personal',
             owner_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -142,6 +143,9 @@ def init_db() -> None:
         todo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
         if "status" not in todo_columns:
             conn.execute("ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'")
+        if "assignee_id" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN assignee_id TEXT")
+        conn.execute("UPDATE todos SET assignee_id=owner_id WHERE assignee_id IS NULL")
         conn.execute("UPDATE todos SET status='done' WHERE completed=1")
         conn.execute("UPDATE todos SET status='todo' WHERE completed=0 AND status='done'")
 
@@ -871,8 +875,9 @@ def get_kanban_data(request: Request, x_user_id: str | None = Header(default=Non
     with db() as conn:
         users = conn.execute("SELECT id,display_name FROM users ORDER BY display_name COLLATE NOCASE,id").fetchall()
         todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.priority,t.completed,t.status,
-                                       t.owner_id,t.created_at,u.display_name
-                                FROM todos t JOIN users u ON u.id=t.owner_id
+                                       t.owner_id,COALESCE(t.assignee_id,t.owner_id) AS assignee_id,
+                                       t.created_at,u.display_name
+                                FROM todos t JOIN users u ON u.id=COALESCE(t.assignee_id,t.owner_id)
                                 WHERE t.visibility='shared'
                                 ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.id""").fetchall()
     audit(request, user["id"], "KANBAN_VIEW", result_count=len(todos))
@@ -894,7 +899,7 @@ def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
         if not conn.execute("SELECT 1 FROM users WHERE id=?", (payload.owner_id,)).fetchone():
             raise HTTPException(404, "담당 사용자를 찾을 수 없습니다.")
         completed = 1 if payload.status == "done" else 0
-        conn.execute("UPDATE todos SET owner_id=?,status=?,completed=? WHERE id=?",
+        conn.execute("UPDATE todos SET assignee_id=?,status=?,completed=? WHERE id=?",
                      (payload.owner_id,payload.status,completed,todo_id))
     audit(request, user["id"], "TODO_KANBAN_MOVE", todo_id=todo_id, title=row["title"],
           owner_id=payload.owner_id, status=payload.status)
@@ -1114,7 +1119,7 @@ function toast(message){$('toast').textContent=message;$('toast').style.display=
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
 async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');render(data)}catch(e){toast(e.message)}}
 function render(data){const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
-for(const member of data.users){const memberTodos=data.todos.filter(t=>t.owner_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
+for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
 for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task '+(t.priority==='high'?'high':'')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div><div class="task-meta"><span>'+({high:'높음',normal:'보통',low:'낮음'}[t.priority]||'보통')+'</span><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
 html+='</div>'}board.innerHTML=html;
 board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
