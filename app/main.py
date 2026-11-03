@@ -41,7 +41,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.2.3")
+app = FastAPI(title="사내 공용 캘린더", version="0.3.0")
 
 
 def db() -> sqlite3.Connection:
@@ -87,6 +87,7 @@ def init_db() -> None:
             due_date TEXT,
             priority TEXT NOT NULL DEFAULT 'normal',
             completed INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'todo',
             visibility TEXT NOT NULL DEFAULT 'personal',
             owner_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -104,6 +105,17 @@ def init_db() -> None:
             FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE,
             FOREIGN KEY(uploaded_by) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS event_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_comments_event ON event_comments(event_id, created_at);
         CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -127,6 +139,11 @@ def init_db() -> None:
         ]:
             if name not in event_columns:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {name} {sql_type} DEFAULT {default}")
+        todo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
+        if "status" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'")
+        conn.execute("UPDATE todos SET status='done' WHERE completed=1")
+        conn.execute("UPDATE todos SET status='todo' WHERE completed=0 AND status='done'")
 
 
 init_db()
@@ -167,6 +184,15 @@ class TodoIn(BaseModel):
 
 class ParseIn(BaseModel):
     text: str = Field(min_length=1, max_length=300)
+
+
+class EventCommentIn(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+
+
+class TodoMoveIn(BaseModel):
+    status: str = Field(min_length=1, max_length=20)
+    owner_id: str = Field(min_length=8, max_length=80)
 
 
 def client_ip(request: Request) -> str:
@@ -416,6 +442,11 @@ def event_to_dict(row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
     return HTML
+
+
+@app.get("/kanban", response_class=HTMLResponse)
+def kanban_page() -> str:
+    return KANBAN_HTML
 
 
 @app.post("/api/users/identify")
@@ -717,6 +748,72 @@ def delete_attachment(attachment_id: int, request: Request,
     return {"ok": True}
 
 
+@app.get("/api/events/{event_id}/comments")
+def list_event_comments(event_id: int, request: Request,
+                        x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM events WHERE id=?", (event_id,)).fetchone():
+            raise HTTPException(404, "일정을 찾을 수 없습니다.")
+        rows = conn.execute("""SELECT c.id,c.event_id,c.user_id,c.content,c.created_at,c.updated_at,
+                                      u.display_name
+                               FROM event_comments c JOIN users u ON u.id=c.user_id
+                               WHERE c.event_id=? ORDER BY c.created_at,c.id""", (event_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/events/{event_id}/comments")
+def create_event_comment(event_id: int, payload: EventCommentIn, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(422, "댓글 내용을 입력하세요.")
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM events WHERE id=?", (event_id,)).fetchone():
+            raise HTTPException(404, "일정을 찾을 수 없습니다.")
+        cur = conn.execute("""INSERT INTO event_comments(event_id,user_id,content,created_at,updated_at)
+                              VALUES(?,?,?,?,?)""", (event_id,user["id"],content,now,now))
+        comment_id = cur.lastrowid
+    audit(request, user["id"], "EVENT_COMMENT_CREATE", event_id=event_id, comment_id=comment_id)
+    return {"id": comment_id}
+
+
+@app.patch("/api/event-comments/{comment_id}")
+def update_event_comment(comment_id: int, payload: EventCommentIn, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(422, "댓글 내용을 입력하세요.")
+    with db() as conn:
+        row = conn.execute("SELECT user_id,event_id FROM event_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+        if row["user_id"] != user["id"]:
+            raise HTTPException(403, "본인이 작성한 댓글만 수정할 수 있습니다.")
+        conn.execute("UPDATE event_comments SET content=?,updated_at=? WHERE id=?",
+                     (content,datetime.now().isoformat(timespec="seconds"),comment_id))
+    audit(request, user["id"], "EVENT_COMMENT_UPDATE", event_id=row["event_id"], comment_id=comment_id)
+    return {"ok": True}
+
+
+@app.delete("/api/event-comments/{comment_id}")
+def delete_event_comment(comment_id: int, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        row = conn.execute("SELECT user_id,event_id FROM event_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+        if row["user_id"] != user["id"]:
+            raise HTTPException(403, "본인이 작성한 댓글만 삭제할 수 있습니다.")
+        conn.execute("DELETE FROM event_comments WHERE id=?", (comment_id,))
+    audit(request, user["id"], "EVENT_COMMENT_DELETE", event_id=row["event_id"], comment_id=comment_id)
+    return {"ok": True}
+
+
 @app.get("/api/todos")
 def list_todos(request: Request, x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
@@ -761,9 +858,46 @@ def toggle_todo(todo_id: int, request: Request,
         if row["owner_id"] != user["id"] and row["visibility"] != "shared":
             raise HTTPException(403, "개인 Todo는 등록자만 완료 상태를 변경할 수 있습니다.")
         completed = 0 if row["completed"] else 1
-        conn.execute("UPDATE todos SET completed=? WHERE id=?", (completed, todo_id))
+        conn.execute("UPDATE todos SET completed=?,status=? WHERE id=?",
+                     (completed, "done" if completed else "todo", todo_id))
     audit(request, user["id"], "TODO_COMPLETE" if completed else "TODO_REOPEN",
           todo_id=todo_id, title=row["title"])
+    return {"ok": True, "completed": bool(completed)}
+
+
+@app.get("/api/kanban")
+def get_kanban_data(request: Request, x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        users = conn.execute("SELECT id,display_name FROM users ORDER BY display_name COLLATE NOCASE,id").fetchall()
+        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.priority,t.completed,t.status,
+                                       t.owner_id,t.created_at,u.display_name
+                                FROM todos t JOIN users u ON u.id=t.owner_id
+                                WHERE t.visibility='shared'
+                                ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.id""").fetchall()
+    audit(request, user["id"], "KANBAN_VIEW", result_count=len(todos))
+    return {"users":[dict(row) for row in users],"todos":[dict(row) for row in todos]}
+
+
+@app.patch("/api/kanban/todos/{todo_id}")
+def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
+                     x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    if payload.status not in ("todo", "in_progress", "done"):
+        raise HTTPException(422, "칸반 단계가 올바르지 않습니다.")
+    with db() as conn:
+        row = conn.execute("SELECT title,visibility FROM todos WHERE id=?", (todo_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Todo를 찾을 수 없습니다.")
+        if row["visibility"] != "shared":
+            raise HTTPException(403, "공용 Todo만 칸반 보드에서 이동할 수 있습니다.")
+        if not conn.execute("SELECT 1 FROM users WHERE id=?", (payload.owner_id,)).fetchone():
+            raise HTTPException(404, "담당 사용자를 찾을 수 없습니다.")
+        completed = 1 if payload.status == "done" else 0
+        conn.execute("UPDATE todos SET owner_id=?,status=?,completed=? WHERE id=?",
+                     (payload.owner_id,payload.status,completed,todo_id))
+    audit(request, user["id"], "TODO_KANBAN_MOVE", todo_id=todo_id, title=row["title"],
+          owner_id=payload.owner_id, status=payload.status)
     return {"ok": True, "completed": bool(completed)}
 
 
