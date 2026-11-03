@@ -1,0 +1,17 @@
+[project]
+name = "company-calendar"
+version = "0.2.1"
+description = "Portable internal shared calendar and todo app"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "python-multipart>=0.0.20,<1.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
