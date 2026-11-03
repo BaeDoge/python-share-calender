@@ -472,6 +472,65 @@ def admin_page() -> str:
     return ADMIN_HTML
 
 
+
+def require_admin(x_admin_token: str | None) -> None:
+    expected = os.getenv("CALENDAR_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(503, "서버 환경변수 CALENDAR_ADMIN_TOKEN이 설정되지 않았습니다.")
+    if not x_admin_token or not hmac.compare_digest(x_admin_token, expected):
+        raise HTTPException(403, "관리자 인증에 실패했습니다.")
+
+
+@app.get("/api/admin/summary")
+def admin_summary(x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    with db() as conn:
+        result = {
+            "users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM events WHERE deleted_at IS NULL").fetchone()[0],
+            "deleted_events": conn.execute("SELECT COUNT(*) FROM events WHERE deleted_at IS NOT NULL").fetchone()[0],
+            "todos": conn.execute("SELECT COUNT(*) FROM todos WHERE deleted_at IS NULL").fetchone()[0],
+            "deleted_todos": conn.execute("SELECT COUNT(*) FROM todos WHERE deleted_at IS NOT NULL").fetchone()[0],
+            "comments": conn.execute("SELECT COUNT(*) FROM event_comments").fetchone()[0],
+            "logs": conn.execute("SELECT COUNT(*) FROM activity_logs").fetchone()[0],
+        }
+    return result
+
+
+@app.get("/api/admin/records")
+def admin_records(table: str, limit: int = 100, offset: int = 0,
+                  x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    if table not in ADMIN_TABLES:
+        raise HTTPException(400, "조회할 수 없는 테이블입니다.")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    with db() as conn:
+        total = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        rows = conn.execute(f'SELECT * FROM "{table}" ORDER BY rowid DESC LIMIT ? OFFSET ?',
+                            (limit, offset)).fetchall()
+        columns = [row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+    return {"table": table, "columns": columns, "total": total,
+            "limit": limit, "offset": offset, "records": [dict(row) for row in rows]}
+
+
+@app.post("/api/admin/restore/{table}/{record_id}")
+def admin_restore(table: str, record_id: int, request: Request,
+                  x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    if table not in ("events", "todos"):
+        raise HTTPException(400, "일정 또는 Todo만 복구할 수 있습니다.")
+    with db() as conn:
+        row = conn.execute(f'SELECT id,deleted_at FROM "{table}" WHERE id=?', (record_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "기록을 찾을 수 없습니다.")
+        if not row["deleted_at"]:
+            raise HTTPException(409, "이미 활성 상태인 기록입니다.")
+        conn.execute(f'UPDATE "{table}" SET deleted_at=NULL,deleted_by=NULL WHERE id=?', (record_id,))
+    logger.info("ADMIN_RESTORE table=%s record_id=%s", table, record_id)
+    return {"ok": True}
+
+
 @app.post("/api/users/identify")
 def identify_user(payload: IdentifyIn, request: Request):
     ip = client_ip(request)
@@ -905,7 +964,7 @@ def get_kanban_data(request: Request, x_user_id: str | None = Header(default=Non
 def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
                      x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
-    if payload.status not in ("todo", "in_progress", "blocked", "done"):
+    if payload.status not in ("todo", "in_progress", "blocked", "done", "trash"):
         raise HTTPException(422, "칸반 단계가 올바르지 않습니다.")
     with db() as conn:
         row = conn.execute("SELECT title,visibility,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
@@ -1150,4 +1209,33 @@ board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart'
 board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast('업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
 }
 $('reload').onclick=load;load();
+</script></body></html>'''
+
+
+
+ADMIN_HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>관리자 이력 및 DB 조회</title>
+<style>
+:root{font-family:Inter,"Pretendard","Noto Sans KR","Malgun Gothic",system-ui,sans-serif;color:#172033;background:#f4f6fa;--line:#e6eaf2;--muted:#758096}
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa}.shell{max-width:1500px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px}.top h1{font-size:21px;margin:0}.top p{font-size:12px;color:var(--muted);margin:5px 0 0}button,a,input,select{font:inherit}button,a{border:1px solid #dce2ed;background:white;border-radius:9px;padding:9px 12px;font-size:12px;color:#344054;text-decoration:none;cursor:pointer}.primary{background:#3659d9;color:white;border-color:#3659d9}.danger{color:#b42332;border-color:#f1d5d8}.panel{background:white;border:1px solid var(--line);border-radius:13px;padding:16px;margin-bottom:15px}.auth{max-width:520px;margin:60px auto}.auth h2{font-size:16px;margin:0 0 8px}.auth p,.hint{font-size:11px;color:var(--muted);line-height:1.6}.auth-row{display:flex;gap:8px}.auth-row input{flex:1;min-width:0}input,select{border:1px solid #dce2ed;border-radius:9px;padding:9px 10px;font-size:12px}.stats{display:grid;grid-template-columns:repeat(7,minmax(100px,1fr));gap:9px}.stat{background:#f8faff;border:1px solid var(--line);border-radius:10px;padding:12px}.stat strong{display:block;font-size:20px}.stat span{font-size:10px;color:var(--muted)}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.toolbar select{min-width:190px}.toolbar input{min-width:220px;flex:1}.table-wrap{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:9px;margin-top:12px}table{border-collapse:collapse;width:100%;font-size:11px;white-space:nowrap}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #edf0f5;vertical-align:top}th{position:sticky;top:0;background:#f8faff;z-index:1;color:#59657b}td pre{white-space:pre-wrap;overflow-wrap:anywhere;max-width:360px;max-height:130px;overflow:auto;margin:0;font:inherit}.muted{color:var(--muted)}.hidden{display:none!important}.status{font-size:11px;margin-left:auto;color:#667085}@media(max-width:900px){.stats{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start;flex-direction:column}.shell{padding:14px}}
+</style></head><body><main class="shell">
+<header class="top"><div><h1>관리자 이력 및 DB 조회</h1><p>일정, TODO, 사용자, 댓글, 활동 로그를 읽기 전용으로 확인합니다.</p></div><div><a href="/">캘린더</a> <a href="/kanban">팀 칸반</a></div></header>
+<section class="panel auth" id="auth"><h2>관리자 인증</h2><p>서버 운영자가 설정한 CALENDAR_ADMIN_TOKEN을 입력하세요. 토큰은 이 브라우저 탭의 세션에만 보관됩니다.</p><div class="auth-row"><input id="token" type="password" placeholder="관리자 토큰"><button id="login" class="primary">인증</button></div><p id="authError"></p></section>
+<section id="app" class="hidden">
+<div class="panel stats" id="stats"></div>
+<div class="panel"><div class="toolbar"><select id="table"><option value="activity_logs">활동 로그</option><option value="events">일정 전체 이력</option><option value="todos">TODO 전체 이력</option><option value="users">사용자</option><option value="event_comments">일정 댓글</option><option value="attachments">첨부파일 메타데이터</option></select><input id="filter" placeholder="현재 조회 결과에서 검색"><button id="refresh" class="primary">새로고침</button><span id="count" class="status"></span></div><p class="hint">DB 레코드는 읽기 전용으로 표시됩니다. 삭제된 일정과 TODO는 deleted_at 값으로 구분되며, 복구 버튼으로 다시 활성화할 수 있습니다. 실제 DB 파일이나 비밀번호 등 서버 비밀정보는 제공하지 않습니다.</p><div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div><div class="toolbar" style="margin-top:10px"><button id="prev">이전</button><button id="next">다음</button><span id="page" class="status"></span><button id="logout" style="margin-left:auto">로그아웃</button></div></div>
+</section></main>
+<script>
+const $=id=>document.getElementById(id);let token=sessionStorage.getItem('calendar-admin-token')||'';let offset=0,limit=100,currentRows=[];
+const labels={users:'사용자',events:'활성 일정',deleted_events:'삭제된 일정',todos:'활성 TODO',deleted_todos:'삭제된 TODO',comments:'댓글',logs:'활동 로그'};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-Admin-Token':token,'Content-Type':'application/json',...(opts.headers||{})}});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.detail||'요청 실패');return data}
+function showError(e){$('authError').textContent=e.message}
+async function unlock(){token=$('token').value.trim();try{await loadSummary();sessionStorage.setItem('calendar-admin-token',token);$('auth').classList.add('hidden');$('app').classList.remove('hidden');await loadRecords()}catch(e){token='';showError(e)}}
+async function loadSummary(){const data=await api('/api/admin/summary');$('stats').innerHTML=Object.entries(data).map(([k,v])=>'<div class="stat"><strong>'+v+'</strong><span>'+labels[k]+'</span></div>').join('')}
+async function loadRecords(){try{const table=$('table').value;const data=await api('/api/admin/records?table='+encodeURIComponent(table)+'&limit='+limit+'&offset='+offset);currentRows=data.records;$('thead').innerHTML='<tr>'+data.columns.map(c=>'<th>'+esc(c)+'</th>').join('')+'<th>관리</th></tr>';renderRows(data.columns);$('count').textContent=data.total+'건';$('page').textContent=(offset+1)+'–'+Math.min(offset+limit,data.total)+' / '+data.total;$('prev').disabled=offset===0;$('next').disabled=offset+limit>=data.total}catch(e){if(e.message.includes('인증')){sessionStorage.removeItem('calendar-admin-token');$('app').classList.add('hidden');$('auth').classList.remove('hidden')}showError(e)}}
+function renderRows(columns){const q=$('filter').value.trim().toLowerCase();const rows=currentRows.filter(row=>!q||columns.some(c=>String(row[c]??'').toLowerCase().includes(q)));$('tbody').innerHTML=rows.map(row=>'<tr>'+columns.map(c=>'<td><pre>'+esc(typeof row[c]==='object'?JSON.stringify(row[c]):row[c])+'</pre></td>').join('')+'<td>'+((row.deleted_at&&['events','todos'].includes($('table').value))?'<button class="primary" data-restore="'+row.id+'">복구</button>':'—')+'</td></tr>').join('')||'<tr><td colspan="'+(columns.length+1)+'" class="muted">표시할 데이터가 없습니다.</td></tr>';$('tbody').querySelectorAll('[data-restore]').forEach(b=>b.onclick=async()=>{if(!confirm('이 항목을 복구할까요?'))return;try{await api('/api/admin/restore/'+$('table').value+'/'+b.dataset.restore,{method:'POST'});await loadSummary();await loadRecords()}catch(e){showError(e)}})}
+$('login').onclick=unlock;$('token').addEventListener('keydown',e=>{if(e.key==='Enter')unlock()});$('table').onchange=()=>{offset=0;loadRecords()};$('refresh').onclick=async()=>{await loadSummary();await loadRecords()};$('filter').oninput=()=>{const cols=currentRows.length?Object.keys(currentRows[0]):[];renderRows(cols)};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);loadRecords()};$('next').onclick=()=>{offset+=limit;loadRecords()};$('logout').onclick=()=>{sessionStorage.removeItem('calendar-admin-token');token='';$('app').classList.add('hidden');$('auth').classList.remove('hidden');$('token').value=''};
+if(token){$('token').value=token;unlock()}
 </script></body></html>'''
