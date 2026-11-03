@@ -527,7 +527,7 @@ def admin_restore(table: str, record_id: int, request: Request,
         if not row["deleted_at"]:
             raise HTTPException(409, "이미 활성 상태인 기록입니다.")
         conn.execute(f'UPDATE "{table}" SET deleted_at=NULL,deleted_by=NULL WHERE id=?', (record_id,))
-    logger.info("ADMIN_RESTORE table=%s record_id=%s", table, record_id)
+    audit(request, None, "ADMIN_RESTORE", table=table, record_id=record_id)
     return {"ok": True}
 
 
@@ -1191,7 +1191,7 @@ KANBAN_HTML = r'''<!doctype html>
 @media(max-width:700px){.shell{padding:15px}.top{align-items:flex-start;flex-direction:column}.board-head,.board-row{grid-template-columns:125px repeat(3,minmax(190px,1fr))}}
 </style></head><body><div class="shell">
 <header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
-<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계가 변경되고, 다른 구성원의 행으로 옮기면 담당자도 변경됩니다. 완료 항목은 메인 캘린더의 TODO에도 완료로 반영됩니다.</p>
+<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계가 변경되고, 다른 구성원의 행으로 옮기면 담당자도 변경됩니다. 완료됨은 메인 TODO에 완료로 반영됩니다. 휴지통으로 이동한 항목은 목록에서 숨겨지고 관리자 페이지에서 복구할 수 있습니다.</p>
 <div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
 </div><div class="toast" id="toast"></div>
 <script>
