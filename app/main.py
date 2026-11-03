@@ -967,7 +967,7 @@ def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
     if payload.status not in ("todo", "in_progress", "blocked", "done", "trash"):
         raise HTTPException(422, "칸반 단계가 올바르지 않습니다.")
     with db() as conn:
-        row = conn.execute("SELECT title,visibility,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
+        row = conn.execute("SELECT title,visibility,deleted_at,completed FROM todos WHERE id=?", (todo_id,)).fetchone()
         if not row or row["deleted_at"]:
             raise HTTPException(404, "Todo를 찾을 수 없습니다.")
         if row["visibility"] != "shared":
@@ -978,7 +978,7 @@ def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
             deleted_at = datetime.now().isoformat(timespec="seconds")
             conn.execute("UPDATE todos SET deleted_at=?,deleted_by=? WHERE id=?",
                          (deleted_at,user["id"],todo_id))
-            completed = bool(row.get("completed", 0)) if isinstance(row, dict) else False
+            completed = bool(row["completed"])
         else:
             completed = 1 if payload.status == "done" else 0
             conn.execute("UPDATE todos SET assignee_id=?,status=?,completed=? WHERE id=?",
