@@ -41,7 +41,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.2.3")
+app = FastAPI(title="사내 공용 캘린더", version="0.3.0")
 
 
 def db() -> sqlite3.Connection:
@@ -87,6 +87,8 @@ def init_db() -> None:
             due_date TEXT,
             priority TEXT NOT NULL DEFAULT 'normal',
             completed INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'todo',
+            assignee_id TEXT,
             visibility TEXT NOT NULL DEFAULT 'personal',
             owner_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -104,6 +106,17 @@ def init_db() -> None:
             FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE,
             FOREIGN KEY(uploaded_by) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS event_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_comments_event ON event_comments(event_id, created_at);
         CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -127,6 +140,14 @@ def init_db() -> None:
         ]:
             if name not in event_columns:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {name} {sql_type} DEFAULT {default}")
+        todo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
+        if "status" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'")
+        if "assignee_id" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN assignee_id TEXT")
+        conn.execute("UPDATE todos SET assignee_id=owner_id WHERE assignee_id IS NULL")
+        conn.execute("UPDATE todos SET status='done' WHERE completed=1")
+        conn.execute("UPDATE todos SET status='todo' WHERE completed=0 AND status='done'")
 
 
 init_db()
@@ -169,6 +190,15 @@ class ParseIn(BaseModel):
     text: str = Field(min_length=1, max_length=300)
 
 
+class EventCommentIn(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+
+
+class TodoMoveIn(BaseModel):
+    status: str = Field(min_length=1, max_length=20)
+    owner_id: str = Field(min_length=8, max_length=80)
+
+
 def client_ip(request: Request) -> str:
     # 프록시 헤더는 신뢰하지 않고 TCP 연결 상대 IP를 사용합니다.
     return request.client.host if request.client else "unknown"
@@ -183,7 +213,7 @@ def audit(request: Request, user_id: str | None, action: str, **details: Any) ->
             if user_id:
                 row = conn.execute("SELECT display_name FROM users WHERE id=?", (user_id,)).fetchone()
                 if row:
-                    actor = f"{row['display_name']}[{user_id}]"
+                    actor = row["display_name"]
             safe_details = json.dumps(details, ensure_ascii=False, default=str)
             logger.info("IP=%s | USER=%s | ACTION=%s | DETAILS=%s", ip, actor, action, safe_details)
             conn.execute(
@@ -416,6 +446,11 @@ def event_to_dict(row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
     return HTML
+
+
+@app.get("/kanban", response_class=HTMLResponse)
+def kanban_page() -> str:
+    return KANBAN_HTML
 
 
 @app.post("/api/users/identify")
@@ -717,6 +752,72 @@ def delete_attachment(attachment_id: int, request: Request,
     return {"ok": True}
 
 
+@app.get("/api/events/{event_id}/comments")
+def list_event_comments(event_id: int, request: Request,
+                        x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM events WHERE id=?", (event_id,)).fetchone():
+            raise HTTPException(404, "일정을 찾을 수 없습니다.")
+        rows = conn.execute("""SELECT c.id,c.event_id,c.user_id,c.content,c.created_at,c.updated_at,
+                                      u.display_name
+                               FROM event_comments c JOIN users u ON u.id=c.user_id
+                               WHERE c.event_id=? ORDER BY c.created_at,c.id""", (event_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/events/{event_id}/comments")
+def create_event_comment(event_id: int, payload: EventCommentIn, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(422, "댓글 내용을 입력하세요.")
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM events WHERE id=?", (event_id,)).fetchone():
+            raise HTTPException(404, "일정을 찾을 수 없습니다.")
+        cur = conn.execute("""INSERT INTO event_comments(event_id,user_id,content,created_at,updated_at)
+                              VALUES(?,?,?,?,?)""", (event_id,user["id"],content,now,now))
+        comment_id = cur.lastrowid
+    audit(request, user["id"], "EVENT_COMMENT_CREATE", event_id=event_id, comment_id=comment_id)
+    return {"id": comment_id}
+
+
+@app.patch("/api/event-comments/{comment_id}")
+def update_event_comment(comment_id: int, payload: EventCommentIn, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(422, "댓글 내용을 입력하세요.")
+    with db() as conn:
+        row = conn.execute("SELECT user_id,event_id FROM event_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+        if row["user_id"] != user["id"]:
+            raise HTTPException(403, "본인이 작성한 댓글만 수정할 수 있습니다.")
+        conn.execute("UPDATE event_comments SET content=?,updated_at=? WHERE id=?",
+                     (content,datetime.now().isoformat(timespec="seconds"),comment_id))
+    audit(request, user["id"], "EVENT_COMMENT_UPDATE", event_id=row["event_id"], comment_id=comment_id)
+    return {"ok": True}
+
+
+@app.delete("/api/event-comments/{comment_id}")
+def delete_event_comment(comment_id: int, request: Request,
+                         x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        row = conn.execute("SELECT user_id,event_id FROM event_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+        if row["user_id"] != user["id"]:
+            raise HTTPException(403, "본인이 작성한 댓글만 삭제할 수 있습니다.")
+        conn.execute("DELETE FROM event_comments WHERE id=?", (comment_id,))
+    audit(request, user["id"], "EVENT_COMMENT_DELETE", event_id=row["event_id"], comment_id=comment_id)
+    return {"ok": True}
+
+
 @app.get("/api/todos")
 def list_todos(request: Request, x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
@@ -761,9 +862,47 @@ def toggle_todo(todo_id: int, request: Request,
         if row["owner_id"] != user["id"] and row["visibility"] != "shared":
             raise HTTPException(403, "개인 Todo는 등록자만 완료 상태를 변경할 수 있습니다.")
         completed = 0 if row["completed"] else 1
-        conn.execute("UPDATE todos SET completed=? WHERE id=?", (completed, todo_id))
+        conn.execute("UPDATE todos SET completed=?,status=? WHERE id=?",
+                     (completed, "done" if completed else "todo", todo_id))
     audit(request, user["id"], "TODO_COMPLETE" if completed else "TODO_REOPEN",
           todo_id=todo_id, title=row["title"])
+    return {"ok": True, "completed": bool(completed)}
+
+
+@app.get("/api/kanban")
+def get_kanban_data(request: Request, x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    with db() as conn:
+        users = conn.execute("SELECT id,display_name FROM users ORDER BY display_name COLLATE NOCASE,id").fetchall()
+        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.priority,t.completed,t.status,
+                                       t.owner_id,COALESCE(t.assignee_id,t.owner_id) AS assignee_id,
+                                       t.created_at,u.display_name
+                                FROM todos t JOIN users u ON u.id=COALESCE(t.assignee_id,t.owner_id)
+                                WHERE t.visibility='shared'
+                                ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.id""").fetchall()
+    audit(request, user["id"], "KANBAN_VIEW", result_count=len(todos))
+    return {"users":[dict(row) for row in users],"todos":[dict(row) for row in todos]}
+
+
+@app.patch("/api/kanban/todos/{todo_id}")
+def move_kanban_todo(todo_id: int, payload: TodoMoveIn, request: Request,
+                     x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    if payload.status not in ("todo", "in_progress", "done"):
+        raise HTTPException(422, "칸반 단계가 올바르지 않습니다.")
+    with db() as conn:
+        row = conn.execute("SELECT title,visibility FROM todos WHERE id=?", (todo_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Todo를 찾을 수 없습니다.")
+        if row["visibility"] != "shared":
+            raise HTTPException(403, "공용 Todo만 칸반 보드에서 이동할 수 있습니다.")
+        if not conn.execute("SELECT 1 FROM users WHERE id=?", (payload.owner_id,)).fetchone():
+            raise HTTPException(404, "담당 사용자를 찾을 수 없습니다.")
+        completed = 1 if payload.status == "done" else 0
+        conn.execute("UPDATE todos SET assignee_id=?,status=?,completed=? WHERE id=?",
+                     (payload.owner_id,payload.status,completed,todo_id))
+    audit(request, user["id"], "TODO_KANBAN_MOVE", todo_id=todo_id, title=row["title"],
+          owner_id=payload.owner_id, status=payload.status)
     return {"ok": True, "completed": bool(completed)}
 
 
@@ -788,7 +927,7 @@ HTML = r'''<!doctype html>
 <title>사내 공용 캘린더</title>
 <style>
 :root{font-family:Inter,"Pretendard","Noto Sans KR","Malgun Gothic",system-ui,sans-serif;color:#172033;background:#f3f6fb;font-synthesis:none;text-rendering:optimizeLegibility;--primary:#3659d9;--primary-dark:#2848bd;--line:#e6eaf2;--muted:#758096;--surface:#fff;--soft:#f7f9fc;--shadow:0 12px 32px rgba(23,35,65,.07)}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 0 0,#edf2ff 0,transparent 32%),#f4f6fa}button,input,select,textarea{font:inherit}button{border:1px solid #dce2ed;background:#fff;color:#344054;border-radius:10px;padding:9px 13px;cursor:pointer;transition:.15s ease}button:hover{border-color:#aebce2;background:#f8faff}button:disabled{opacity:.55;cursor:not-allowed}.primary{background:var(--primary);color:#fff;border-color:var(--primary)}.primary:hover{background:var(--primary-dark);color:#fff}.quiet{border-color:transparent;background:transparent}.danger{color:#c03945;border-color:#f1d5d8;background:#fff8f8}.shell{max-width:1600px;margin:auto;padding:26px 30px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:22px}.brand{display:flex;align-items:center;gap:13px}.brandmark{width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,#4669ee,#2944b6);display:grid;place-items:center;color:#fff;font-size:20px;box-shadow:0 8px 18px #3659d933}.brand h1{margin:0;font-size:21px;letter-spacing:-.6px}.brand p{margin:3px 0 0;color:var(--muted);font-size:12px}.top-actions{display:flex;gap:9px;align-items:center}.user-chip{display:flex;gap:8px;align-items:center;border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 12px;font-size:13px;color:#4b5568}.dot{width:9px;height:9px;border-radius:50%;display:inline-block}.page-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:18px;align-items:start}.panel{background:var(--surface);border:1px solid #e7ebf3;border-radius:17px;box-shadow:var(--shadow);min-width:0}.calendar-panel{padding:20px}.side-panel{padding:18px;position:sticky;top:16px}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.toolbar h2{margin:0;font-size:19px;letter-spacing:-.5px}.toolbar-left,.toolbar-right{display:flex;align-items:center;gap:7px}.icon-btn{font-size:17px;width:38px;height:38px;padding:0}.view-switch{display:flex;padding:3px;border-radius:11px;background:#f0f3f9;gap:2px}.view-switch button{border:0;background:transparent;padding:7px 12px;font-size:12px;color:#667085}.view-switch button.active{background:#fff;color:var(--primary);box-shadow:0 1px 4px #172b4d18}.calendar{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));border-left:1px solid var(--line);border-top:1px solid var(--line);overflow:hidden;border-radius:10px}.weekday{padding:11px 5px;text-align:center;background:#f8faff;border-right:1px solid var(--line);border-bottom:1px solid var(--line);font-size:11px;font-weight:700;letter-spacing:.3px;color:#778197}.day{height:132px;min-width:0;padding:7px 7px 6px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);overflow:hidden;cursor:pointer;background:#fff;transition:background .12s}.day:hover{background:#f9fbff}.day.other{background:#fbfcfe}.day.today{background:#f5f7ff}.day-head{height:25px;display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}.num{width:25px;height:25px;display:grid;place-items:center;border-radius:50%;font-size:12px;color:#45516a;font-weight:600}.today .num{background:var(--primary);color:#fff}.day-events{display:flex;flex-direction:column;gap:3px;overflow:hidden}.event-chip{min-width:0;display:flex;align-items:center;gap:4px;max-width:100%;padding:3px 5px;border-radius:5px;color:#fff;font-size:10px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left;border:0}.event-chip:hover{filter:brightness(.96);color:#fff}.event-chip .kind{font-weight:800;opacity:.9}.event-chip.continues-left{border-top-left-radius:0;border-bottom-left-radius:0;margin-left:-7px;padding-left:10px}.event-chip.continues-right{border-top-right-radius:0;border-bottom-right-radius:0;margin-right:-7px}.more-link{border:0;background:transparent;color:var(--primary);font-size:10px;text-align:left;padding:2px 4px;font-weight:700}.more-link:hover{background:#eef2ff}.calendar-hint{font-size:11px;color:#8791a4;margin:11px 2px 0}.side-section+.side-section{border-top:1px solid #edf0f5;margin-top:18px;padding-top:17px}.section-title{display:flex;align-items:center;justify-content:space-between;margin:0 0 11px;font-size:14px;font-weight:750}.side-label{color:#97a0b1;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}.field{margin:10px 0}.field label{display:block;font-size:11px;color:#667085;margin:0 0 5px;font-weight:650}input,select,textarea{width:100%;border:1px solid #dce2ed;border-radius:10px;background:#fff;color:#273247;padding:10px 11px;outline:none;transition:border .15s,box-shadow .15s}input:focus,select:focus,textarea:focus{border-color:#8da2ed;box-shadow:0 0 0 3px #3659d91a}textarea{resize:vertical}input::placeholder,textarea::placeholder{color:#a6afbf}.full{width:100%}.inline{display:flex;gap:8px}.inline>*{min-width:0;flex:1}.natural-help{margin:7px 1px 0;font-size:10px;line-height:1.5;color:#8993a6}.parse-result{display:none;padding:10px;border-radius:10px;background:#f2f5ff;color:#3e529e;font-size:11px;line-height:1.6;margin-top:9px}.todo-list{margin-top:10px}.todo-item{display:flex;gap:8px;align-items:flex-start;padding:9px 0;border-bottom:1px solid #f0f2f6;font-size:12px}.todo-item:last-child{border-bottom:0}.todo-item input{width:15px;height:15px;margin:1px 0 0;accent-color:var(--primary)}.todo-main{flex:1;min-width:0}.todo-title{display:block;line-height:1.45;overflow-wrap:anywhere}.todo-item.done .todo-title{text-decoration:line-through;color:#a4acba}.todo-meta{font-size:10px;color:#929bad;margin-top:3px}.todo-delete{padding:2px 6px;border:0;color:#9aa3b3;background:transparent}.todo-filter{font-size:10px;padding:5px 7px;border-radius:8px}.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(16,24,40,.48);backdrop-filter:blur(3px);z-index:20}.dialog{width:min(650px,100%);max-height:92vh;overflow:auto;background:#fff;border-radius:18px;padding:22px;box-shadow:0 24px 70px #15213b35}.dialog.wide{width:min(850px,100%)}.dialog-head{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px}.day-dialog-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:none}.day-dialog-actions .close{flex:0 0 34px}.dialog-head h2{font-size:18px;margin:0;letter-spacing:-.4px}.close{border:0;background:#f3f5f9;border-radius:9px;width:32px;height:32px;padding:0;font-size:18px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.form-grid .span2{grid-column:1/-1}.description{min-height:142px}.dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:16px;padding-top:14px;border-top:1px solid #edf0f5}.muted{color:var(--muted)}.hidden{display:none!important}.event-list{display:flex;flex-direction:column;gap:9px}.event-row{display:flex;gap:12px;align-items:flex-start;border:1px solid #e8ecf3;border-radius:12px;padding:12px}.event-color{width:4px;min-height:46px;border-radius:4px;flex:none}.event-row-main{flex:1;min-width:0}.event-row-title{font-size:13px;font-weight:750;overflow-wrap:anywhere}.event-row-meta{font-size:10px;color:#828da1;margin-top:5px;line-height:1.5}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:3px 7px;background:#f0f3fa;color:#59657b;font-size:10px;font-weight:700;margin-right:4px}.attachment-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.attachment{display:flex;align-items:center;gap:6px;background:#f5f7fb;border:1px solid #e8ecf3;padding:6px 8px;border-radius:8px;font-size:10px}.attachment a{color:#3659d9;text-decoration:none}.search-bar{display:flex;align-items:center;gap:7px;width:min(360px,38vw);min-width:250px;flex:0 1 360px;flex-wrap:nowrap;white-space:nowrap}.search-bar input{padding:9px 12px;min-width:0;flex:1 1 auto;width:0}.search-bar button{flex:0 0 auto;min-width:62px;white-space:nowrap}.top-actions{min-width:0}.search-filters{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:8px;margin-bottom:13px}.week-scroll{overflow:auto;border:1px solid var(--line);border-radius:10px}.week-grid{display:grid;grid-template-columns:64px repeat(7,minmax(112px,1fr));min-width:850px}.week-corner,.week-head,.week-label,.week-cell{border-right:1px solid var(--line);border-bottom:1px solid var(--line);min-width:0}.week-head{background:#f8faff;padding:10px 4px;text-align:center;font-size:11px;font-weight:750;color:#5d6980}.week-head.today{color:var(--primary);background:#f0f3ff}.week-label{display:flex;align-items:flex-start;justify-content:center;padding:10px 3px;background:#fafbfd;color:#8b95a7;font-size:10px;font-weight:650}.week-cell{min-height:62px;height:auto;padding:4px;overflow:visible;background:#fff}.week-cell:hover{background:#fafbff}.week-cell.all-day{min-height:76px;height:auto;background:#fbfcff}.week-chip{display:block;width:100%;margin:0 0 3px;text-align:left;border:0;border-radius:5px;padding:4px 5px;color:white;font-size:10px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.week-more{border:0;background:transparent;color:var(--primary);padding:2px;font-size:10px}.settings-note{font-size:11px;line-height:1.6;color:#8791a4}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202b43;color:white;border-radius:10px;padding:10px 16px;font-size:12px;z-index:50;box-shadow:var(--shadow);display:none}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 0 0,#edf2ff 0,transparent 32%),#f4f6fa}button,input,select,textarea{font:inherit}button{border:1px solid #dce2ed;background:#fff;color:#344054;border-radius:10px;padding:9px 13px;cursor:pointer;transition:.15s ease}button:hover{border-color:#aebce2;background:#f8faff}button:disabled{opacity:.55;cursor:not-allowed}.primary{background:var(--primary);color:#fff;border-color:var(--primary)}.primary:hover{background:var(--primary-dark);color:#fff}.quiet{border-color:transparent;background:transparent}.danger{color:#c03945;border-color:#f1d5d8;background:#fff8f8}.shell{max-width:1600px;margin:auto;padding:26px 30px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:22px}.brand{display:flex;align-items:center;gap:13px}.brandmark{width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,#4669ee,#2944b6);display:grid;place-items:center;color:#fff;font-size:20px;box-shadow:0 8px 18px #3659d933}.brand h1{margin:0;font-size:21px;letter-spacing:-.6px}.brand p{margin:3px 0 0;color:var(--muted);font-size:12px}.top-actions{display:flex;gap:9px;align-items:center}.user-chip{display:flex;gap:8px;align-items:center;border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 12px;font-size:13px;color:#4b5568}.dot{width:9px;height:9px;border-radius:50%;display:inline-block}.page-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:18px;align-items:start}.panel{background:var(--surface);border:1px solid #e7ebf3;border-radius:17px;box-shadow:var(--shadow);min-width:0}.calendar-panel{padding:20px}.side-panel{padding:18px;position:sticky;top:16px}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.toolbar h2{margin:0;font-size:19px;letter-spacing:-.5px}.toolbar-left,.toolbar-right{display:flex;align-items:center;gap:7px}.icon-btn{font-size:17px;width:38px;height:38px;padding:0}.view-switch{display:flex;padding:3px;border-radius:11px;background:#f0f3f9;gap:2px}.view-switch button{border:0;background:transparent;padding:7px 12px;font-size:12px;color:#667085}.view-switch button.active{background:#fff;color:var(--primary);box-shadow:0 1px 4px #172b4d18}.calendar{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));border-left:1px solid var(--line);border-top:1px solid var(--line);overflow:hidden;border-radius:10px}.weekday{padding:11px 5px;text-align:center;background:#f8faff;border-right:1px solid var(--line);border-bottom:1px solid var(--line);font-size:11px;font-weight:700;letter-spacing:.3px;color:#778197}.day{height:132px;min-width:0;padding:7px 7px 6px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);overflow:hidden;cursor:pointer;background:#fff;transition:background .12s}.day:hover{background:#f9fbff}.day.other{background:#fbfcfe}.day.today{background:#f5f7ff}.day-head{height:25px;display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}.num{width:25px;height:25px;display:grid;place-items:center;border-radius:50%;font-size:12px;color:#45516a;font-weight:600}.today .num{background:var(--primary);color:#fff}.day-events{display:flex;flex-direction:column;gap:3px;overflow:hidden}.event-chip{min-width:0;display:flex;align-items:center;gap:4px;max-width:100%;padding:3px 5px;border-radius:5px;color:#fff;font-size:10px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left;border:0}.event-chip:hover{filter:brightness(.96);color:#fff}.event-chip .kind{font-weight:800;opacity:.9}.event-chip.continues-left{border-top-left-radius:0;border-bottom-left-radius:0;margin-left:-7px;padding-left:10px}.event-chip.continues-right{border-top-right-radius:0;border-bottom-right-radius:0;margin-right:-7px}.more-link{border:0;background:transparent;color:var(--primary);font-size:10px;text-align:left;padding:2px 4px;font-weight:700}.more-link:hover{background:#eef2ff}.calendar-hint{font-size:11px;color:#8791a4;margin:11px 2px 0}.side-section+.side-section{border-top:1px solid #edf0f5;margin-top:18px;padding-top:17px}.section-title{display:flex;align-items:center;justify-content:space-between;margin:0 0 11px;font-size:14px;font-weight:750}.side-label{color:#97a0b1;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}.field{margin:10px 0}.field label{display:block;font-size:11px;color:#667085;margin:0 0 5px;font-weight:650}input,select,textarea{width:100%;border:1px solid #dce2ed;border-radius:10px;background:#fff;color:#273247;padding:10px 11px;outline:none;transition:border .15s,box-shadow .15s}input:focus,select:focus,textarea:focus{border-color:#8da2ed;box-shadow:0 0 0 3px #3659d91a}textarea{resize:vertical}input::placeholder,textarea::placeholder{color:#a6afbf}.full{width:100%}.inline{display:flex;gap:8px}.inline>*{min-width:0;flex:1}.natural-help{margin:7px 1px 0;font-size:10px;line-height:1.5;color:#8993a6}.parse-result{display:none;padding:10px;border-radius:10px;background:#f2f5ff;color:#3e529e;font-size:11px;line-height:1.6;margin-top:9px}.todo-list{margin-top:10px}.todo-item{display:flex;gap:8px;align-items:flex-start;padding:9px 0;border-bottom:1px solid #f0f2f6;font-size:12px}.todo-item:last-child{border-bottom:0}.todo-item input{width:15px;height:15px;margin:1px 0 0;accent-color:var(--primary)}.todo-main{flex:1;min-width:0}.todo-title{display:block;line-height:1.45;overflow-wrap:anywhere}.todo-item.done .todo-title{text-decoration:line-through;color:#a4acba}.todo-meta{font-size:10px;color:#929bad;margin-top:3px}.todo-delete{padding:2px 6px;border:0;color:#9aa3b3;background:transparent}.todo-filter{font-size:10px;padding:5px 7px;border-radius:8px}.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(16,24,40,.48);backdrop-filter:blur(3px);z-index:20}.dialog{width:min(650px,100%);max-height:92vh;overflow:auto;background:#fff;border-radius:18px;padding:22px;box-shadow:0 24px 70px #15213b35}.dialog.wide{width:min(850px,100%)}.dialog-head{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px}.day-dialog-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:none}.day-dialog-actions .close{flex:0 0 34px}.dialog-head h2{font-size:18px;margin:0;letter-spacing:-.4px}.close{border:0;background:#f3f5f9;border-radius:9px;width:32px;height:32px;padding:0;font-size:18px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.form-grid .span2{grid-column:1/-1}.description{min-height:142px}.dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:16px;padding-top:14px;border-top:1px solid #edf0f5}.muted{color:var(--muted)}.hidden{display:none!important}.event-list{display:flex;flex-direction:column;gap:9px}.event-row{display:flex;gap:12px;align-items:flex-start;border:1px solid #e8ecf3;border-radius:12px;padding:12px}.event-color{width:4px;min-height:46px;border-radius:4px;flex:none}.event-row-main{flex:1;min-width:0}.event-row-title{font-size:13px;font-weight:750;overflow-wrap:anywhere}.event-row-meta{font-size:10px;color:#828da1;margin-top:5px;line-height:1.5}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:3px 7px;background:#f0f3fa;color:#59657b;font-size:10px;font-weight:700;margin-right:4px}.attachment-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.attachment{display:flex;align-items:center;gap:6px;background:#f5f7fb;border:1px solid #e8ecf3;padding:6px 8px;border-radius:8px;font-size:10px}.attachment a{color:#3659d9;text-decoration:none}.search-bar{display:flex;align-items:center;gap:7px;width:min(360px,38vw);min-width:250px;flex:0 1 360px;flex-wrap:nowrap;white-space:nowrap}.search-bar input{padding:9px 12px;min-width:0;flex:1 1 auto;width:0}.search-bar button{flex:0 0 auto;min-width:62px;white-space:nowrap}.top-actions{min-width:0}.search-filters{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:8px;margin-bottom:13px}.week-scroll{overflow:auto;border:1px solid var(--line);border-radius:10px}.week-grid{display:grid;grid-template-columns:64px repeat(7,minmax(112px,1fr));min-width:850px}.week-corner,.week-head,.week-label,.week-cell{border-right:1px solid var(--line);border-bottom:1px solid var(--line);min-width:0}.week-head{background:#f8faff;padding:10px 4px;text-align:center;font-size:11px;font-weight:750;color:#5d6980}.week-head.today{color:var(--primary);background:#f0f3ff}.week-label{display:flex;align-items:flex-start;justify-content:center;padding:10px 3px;background:#fafbfd;color:#8b95a7;font-size:10px;font-weight:650}.week-cell{min-height:62px;height:auto;padding:4px;overflow:visible;background:#fff}.week-cell:hover{background:#fafbff}.week-cell.all-day{min-height:76px;height:auto;background:#fbfcff}.week-chip{display:block;width:100%;margin:0 0 3px;text-align:left;border:0;border-radius:5px;padding:4px 5px;color:white;font-size:10px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.week-more{border:0;background:transparent;color:var(--primary);padding:2px;font-size:10px}.settings-note{font-size:11px;line-height:1.6;color:#8791a4}.nav-link{display:inline-flex;align-items:center;padding:9px 12px;border:1px solid #dce2ed;border-radius:10px;color:#344054;text-decoration:none;font-size:12px}.event-comments{display:flex;flex-direction:column;gap:8px;margin:8px 0}.event-comment{border:1px solid #e8ecf3;border-radius:10px;padding:9px 11px}.event-comment-head{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#778197}.event-comment-body{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:6px}.event-comment-actions{display:flex;gap:4px}.event-comment-actions button{font-size:10px;padding:3px 7px}.comment-compose{display:flex;align-items:flex-end;gap:8px}.comment-compose textarea{flex:1;min-height:54px}.comment-compose button{white-space:nowrap}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202b43;color:white;border-radius:10px;padding:10px 16px;font-size:12px;z-index:50;box-shadow:var(--shadow);display:none}
 @media(max-width:1120px){.page-grid{grid-template-columns:minmax(0,1fr) 290px}.shell{padding:20px}}
 @media(max-width:900px){.page-grid{grid-template-columns:1fr}.side-panel{position:static}.calendar-panel{padding:12px}.day{height:105px;padding:5px}.event-chip{font-size:9px}.topbar{align-items:flex-start;flex-wrap:wrap}.search-bar{width:min(350px,60vw)}}
 @media(max-width:600px){.shell{padding:12px}.topbar{gap:12px}.top-actions{width:100%;justify-content:space-between;flex-wrap:wrap}.search-bar{order:3;width:100%;min-width:0;flex:1 1 100%}.toolbar{flex-wrap:wrap}.toolbar h2{order:3;width:100%;text-align:center}.day{height:88px;padding:3px}.num{width:22px;height:22px}.event-chip{padding:2px 3px;font-size:8px}.weekday{font-size:10px}.form-grid{grid-template-columns:1fr}.form-grid .span2{grid-column:auto}.search-filters{grid-template-columns:1fr 1fr}.search-filters input:first-child{grid-column:1/-1}}
@@ -799,7 +938,7 @@ HTML = r'''<!doctype html>
  <div class="top-actions">
   <div class="search-bar"><input id="searchInput" placeholder="일정, 담당자, 작업번호 검색…" aria-label="일정 검색"><button id="searchBtn" class="primary">검색</button></div>
   <div class="user-chip"><span class="dot" id="userDot" style="background:#3659d9"></span><span id="who">사용자 확인 중</span></div>
-  <button id="settingsBtn">⚙ 설정</button>
+  <a class="nav-link" href="/kanban">팀 칸반</a><button id="settingsBtn">⚙ 설정</button>
  </div>
 </header>
 <div class="page-grid">
@@ -829,6 +968,7 @@ HTML = r'''<!doctype html>
   </div></div>
   <div class="field span2"><label><input id="eventAllDay" type="checkbox" style="width:auto;vertical-align:middle;margin-right:5px">종일 일정</label></div>
   <div class="field span2"><label>설명 / 작업 내용</label><textarea id="eventDesc" class="description" rows="6" placeholder="일정 상세 내용, 작업 계획, 참고 사항 등을 입력하세요."></textarea></div>
+  <div class="field span2 hidden" id="eventCommentsSection"><label>댓글</label><div id="eventCommentsList" class="event-comments"></div><div class="comment-compose"><textarea id="eventCommentText" rows="2" maxlength="2000" placeholder="일정에 대한 의견이나 진행 상황을 남겨보세요."></textarea><button id="addEventComment" class="primary">댓글 등록</button></div></div>
   <div class="field span2"><label>작업계획서 및 첨부파일 (파일당 최대 20MB)</label><input id="eventFiles" type="file" multiple><div id="existingAttachments" class="attachment-list"></div></div>
  </div>
  <p id="eventOwner" class="settings-note"></p><div class="dialog-actions"><button id="deleteEvent" class="danger hidden" style="margin-right:auto">일정 삭제</button><button data-close="eventModal">취소</button><button id="saveEvent" class="primary">저장</button></div>
@@ -905,10 +1045,18 @@ function weekDraw(){const start=weekStart(cursor),end=new Date(start);end.setDat
 }
 function draw(){if(viewMode==='month')monthDraw();else weekDraw()}
 async function refresh(){const start=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth(),1):weekStart(cursor);const end=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth()+1,7):new Date(weekStart(cursor).getTime()+6*86400000);start.setDate(start.getDate()-7);end.setDate(end.getDate()+7);events=await api(`/api/events?start=${dateKey(start)}&end=${dateKey(end)}`);draw();await loadTodos()}
-function openNew(day=dateKey(new Date()),hour=9,focusTarget='eventTitle'){editing=null;$('eventDialogTitle').textContent='일정 등록';$('eventTitle').value='';$('eventDesc').value='';$('eventCategory').value='기타';$('eventEnvironment').value='';$('eventAssignee').value='';$('eventTicket').value='';$('eventStart').value=`${day}T${pad(hour)}:00`;let end=new Date(`${day}T${pad(hour)}:00`);end.setHours(end.getHours()+1);$('eventEnd').value=localInput(end);$('eventAllDay').checked=false;$('eventFiles').value='';$('existingAttachments').innerHTML='';$('deleteEvent').classList.add('hidden');$('saveEvent').disabled=false;$('eventOwner').textContent='일정은 팀 전체에 공유됩니다. 본인이 등록한 일정만 수정·삭제할 수 있습니다.';updateEnvironment();openModal('eventModal');requestAnimationFrame(()=>$(focusTarget).focus())}
+function openNew(day=dateKey(new Date()),hour=9,focusTarget='eventTitle'){editing=null;$('eventCommentsSection').classList.add('hidden');$('eventCommentsList').innerHTML='';$('eventCommentText').value='';$('eventDialogTitle').textContent='일정 등록';$('eventTitle').value='';$('eventDesc').value='';$('eventCategory').value='기타';$('eventEnvironment').value='';$('eventAssignee').value='';$('eventTicket').value='';$('eventStart').value=`${day}T${pad(hour)}:00`;let end=new Date(`${day}T${pad(hour)}:00`);end.setHours(end.getHours()+1);$('eventEnd').value=localInput(end);$('eventAllDay').checked=false;$('eventFiles').value='';$('existingAttachments').innerHTML='';$('deleteEvent').classList.add('hidden');$('saveEvent').disabled=false;$('eventOwner').textContent='일정은 팀 전체에 공유됩니다. 본인이 등록한 일정만 수정·삭제할 수 있습니다.';updateEnvironment();openModal('eventModal');requestAnimationFrame(()=>$(focusTarget).focus())}
 function updateEnvironment(){const isSrCm=['SR','CM'].includes($('eventCategory').value);$('environmentField').classList.toggle('hidden',!isSrCm);$('srCmFields').classList.toggle('hidden',!isSrCm);if(!isSrCm){$('eventEnvironment').value='';$('eventAssignee').value='';$('eventTicket').value=''}}
 $('eventCategory').onchange=updateEnvironment;
-function openEvent(e){editing=e;$('eventDialogTitle').textContent='일정 수정';$('eventTitle').value=e.title;$('eventDesc').value=e.description||'';$('eventCategory').value=e.category||'기타';$('eventEnvironment').value=e.environment||'';$('eventAssignee').value=e.assignee||'';$('eventTicket').value=e.ticket_no||'';$('eventStart').value=e.start_at.slice(0,16);$('eventEnd').value=e.end_at?e.end_at.slice(0,16):'';$('eventAllDay').checked=!!e.all_day;$('eventFiles').value='';updateEnvironment();$('deleteEvent').classList.toggle('hidden',e.owner_id!==user.id);$('saveEvent').disabled=e.owner_id!==user.id;$('eventOwner').textContent=`등록자: ${e.display_name} · ${eventTimeLabel(e)}`;$('existingAttachments').innerHTML=(e.attachments||[]).map(a=>`<span class="attachment"><a href="#" data-download="${a.id}">${esc(a.original_name)}</a> <small>${Math.ceil(a.size/1024)}KB</small>${e.owner_id===user.id?`<button class="quiet" data-attachment-delete="${a.id}" title="첨부 삭제">×</button>`:''}</span>`).join('');$('existingAttachments').querySelectorAll('[data-download]').forEach(a=>a.onclick=ev=>{ev.preventDefault();downloadAttachment(a.dataset.download)});$('existingAttachments').querySelectorAll('[data-attachment-delete]').forEach(b=>b.onclick=async()=>{if(confirm('첨부파일을 삭제할까요?')){try{await api(`/api/attachments/${b.dataset.attachmentDelete}`,{method:'DELETE'});showToast('첨부파일을 삭제했습니다.');await refresh();let latest=events.find(x=>x.id===e.id);if(latest)openEvent(latest)}catch(err){showToast(err.message)}}});openModal('eventModal');requestAnimationFrame(()=>$('eventDesc').focus())}
+function openEvent(e){editing=e;$('eventCommentsSection').classList.remove('hidden');$('eventCommentsList').innerHTML='<p class="muted" style="font-size:11px">댓글을 불러오는 중...</p>';loadEventComments(e.id).catch(err=>showToast(err.message));
+async function loadEventComments(eventId){
+ const comments=await api('/api/events/'+eventId+'/comments');
+ $('eventCommentsList').innerHTML=comments.length?comments.map(c=>'<div class="event-comment"><div class="event-comment-head"><span>'+esc(c.display_name)+' · '+esc(c.created_at.replace('T',' '))+'</span>'+(c.user_id===user.id?'<span class="event-comment-actions"><button data-comment-edit="'+c.id+'">수정</button><button data-comment-delete="'+c.id+'">삭제</button></span>':'')+'</div><div class="event-comment-body">'+esc(c.content)+'</div></div>').join(''):'<p class="muted" style="font-size:11px">아직 댓글이 없습니다.</p>';
+ $('eventCommentsList').querySelectorAll('[data-comment-edit]').forEach(b=>b.onclick=async()=>{const c=comments.find(x=>x.id===Number(b.dataset.commentEdit));const content=prompt('댓글 내용을 수정하세요.',c?c.content:'');if(content===null)return;try{await api('/api/event-comments/'+c.id,{method:'PATCH',body:JSON.stringify({content})});await loadEventComments(eventId)}catch(e){showToast(e.message)}});
+ $('eventCommentsList').querySelectorAll('[data-comment-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('댓글을 삭제할까요?'))return;try{await api('/api/event-comments/'+b.dataset.commentDelete,{method:'DELETE'});await loadEventComments(eventId)}catch(e){showToast(e.message)}});
+}
+$('addEventComment').onclick=async()=>{if(!editing)return;const content=$('eventCommentText').value.trim();if(!content){showToast('댓글 내용을 입력하세요.');return}try{await api('/api/events/'+editing.id+'/comments',{method:'POST',body:JSON.stringify({content})});$('eventCommentText').value='';await loadEventComments(editing.id);showToast('댓글을 등록했습니다.')}catch(e){showToast(e.message)}};
+$('eventDialogTitle').textContent='일정 수정';$('eventTitle').value=e.title;$('eventDesc').value=e.description||'';$('eventCategory').value=e.category||'기타';$('eventEnvironment').value=e.environment||'';$('eventAssignee').value=e.assignee||'';$('eventTicket').value=e.ticket_no||'';$('eventStart').value=e.start_at.slice(0,16);$('eventEnd').value=e.end_at?e.end_at.slice(0,16):'';$('eventAllDay').checked=!!e.all_day;$('eventFiles').value='';updateEnvironment();$('deleteEvent').classList.toggle('hidden',e.owner_id!==user.id);$('saveEvent').disabled=e.owner_id!==user.id;$('eventOwner').textContent=`등록자: ${e.display_name} · ${eventTimeLabel(e)}`;$('existingAttachments').innerHTML=(e.attachments||[]).map(a=>`<span class="attachment"><a href="#" data-download="${a.id}">${esc(a.original_name)}</a> <small>${Math.ceil(a.size/1024)}KB</small>${e.owner_id===user.id?`<button class="quiet" data-attachment-delete="${a.id}" title="첨부 삭제">×</button>`:''}</span>`).join('');$('existingAttachments').querySelectorAll('[data-download]').forEach(a=>a.onclick=ev=>{ev.preventDefault();downloadAttachment(a.dataset.download)});$('existingAttachments').querySelectorAll('[data-attachment-delete]').forEach(b=>b.onclick=async()=>{if(confirm('첨부파일을 삭제할까요?')){try{await api(`/api/attachments/${b.dataset.attachmentDelete}`,{method:'DELETE'});showToast('첨부파일을 삭제했습니다.');await refresh();let latest=events.find(x=>x.id===e.id);if(latest)openEvent(latest)}catch(err){showToast(err.message)}}});openModal('eventModal');requestAnimationFrame(()=>$('eventDesc').focus())}
 function openDay(key){dayFocus=key;let d=parseDate(key);$('dayDialogTitle').textContent=`${d.getFullYear()}년 ${d.getMonth()+1}월 ${d.getDate()}일 일정`;renderDayEvents();openModal('dayModal')}
 function renderDayEvents(){let list=dayEvents(dayFocus);$('dayEventList').innerHTML=list.length?list.map(e=>`<div class="event-row"><div class="event-color" style="background:${e.color}"></div><div class="event-row-main"><div>${categoryTag(e)}</div><div class="event-row-title">${esc(e.title)}</div><div class="event-row-meta">${eventTimeLabel(e)} · ${esc(e.display_name)}${e.assignee?' · 담당: '+esc(e.assignee):''}${e.ticket_no?' · 작업번호: '+esc(e.ticket_no):''}<br>${esc(e.description||'')}</div>${(e.attachments||[]).length?`<div class="attachment-list">${e.attachments.map(a=>`<span class="attachment"><a href="#" data-day-download="${a.id}">${esc(a.original_name)}</a></span>`).join('')}</div>`:''}</div><button data-day-edit="${e.id}">상세 / 수정</button></div>`).join(''):'<p class="muted" style="font-size:12px">등록된 일정이 없습니다.</p>';$('dayEventList').querySelectorAll('[data-day-edit]').forEach(b=>b.onclick=()=>{let e=events.find(x=>x.id==b.dataset.dayEdit);if(e){closeModal('dayModal');openEvent(e)}});$('dayEventList').querySelectorAll('[data-day-download]').forEach(a=>a.onclick=ev=>{ev.preventDefault();downloadAttachment(a.dataset.dayDownload)})}
 $('addDayEvent').onclick=()=>{closeModal('dayModal');openNew(dayFocus)};
@@ -948,4 +1096,34 @@ async function start(){
  }
 }
 start();
+</script></body></html>'''
+
+
+KANBAN_HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>팀 TODO 칸반 보드</title>
+<style>
+:root{font-family:Inter,"Pretendard","Noto Sans KR","Malgun Gothic",system-ui,sans-serif;color:#172033;background:#f4f6fa;--line:#e6eaf2;--muted:#758096}
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa}.shell{max-width:1700px;margin:auto;padding:24px 28px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}.top h1{font-size:21px;margin:0}.top p{font-size:12px;color:var(--muted);margin:5px 0 0}.top-actions{display:flex;gap:8px;align-items:center}a,button{font:inherit}a{color:#344054;text-decoration:none;border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;font-size:12px}button{border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;cursor:pointer}.board-note{font-size:12px;color:#69758b;margin:0 0 14px}.board-scroll{overflow:auto;border:1px solid var(--line);border-radius:13px;background:white}.board{min-width:900px}.board-head,.board-row{display:grid;grid-template-columns:170px repeat(3,minmax(220px,1fr))}.board-head{position:sticky;top:0;z-index:2;background:#f8faff;border-bottom:1px solid var(--line)}.board-head>div{padding:14px 13px;font-size:12px;font-weight:750;border-right:1px solid var(--line)}.board-head>div:nth-child(2){color:#64748b}.board-head>div:nth-child(3){color:#3563c9}.board-head>div:nth-child(4){color:#16836d}.board-row{border-bottom:1px solid var(--line)}.board-row:last-child{border-bottom:0}.member{padding:14px 12px;border-right:1px solid var(--line);background:#fbfcfe;display:flex;align-items:flex-start;gap:8px;font-size:12px;font-weight:700}.member-count{display:block;font-size:10px;color:#8a94a6;font-weight:500;margin-top:4px}.dropzone{min-height:112px;padding:9px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:8px;transition:background .12s}.dropzone:last-child{border-right:0}.dropzone.drag-over{background:#eef3ff;outline:2px dashed #8ba3ed;outline-offset:-4px}.task{background:white;border:1px solid #e5eaf2;border-left:3px solid #9aa7bd;border-radius:9px;padding:10px 11px;box-shadow:0 2px 7px rgba(20,35,65,.04);cursor:grab}.task:active{cursor:grabbing}.task.high{border-left-color:#d97757}.task-title{font-size:12px;font-weight:700;line-height:1.5;overflow-wrap:anywhere}.task-meta{font-size:10px;color:#7c879b;margin-top:7px;display:flex;justify-content:space-between;gap:6px}.empty{color:#a0a8b7;font-size:10px;text-align:center;padding:12px 0}.status-count{font-size:10px;color:#8b95a7;font-weight:500;margin-left:5px}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202b43;color:white;padding:10px 15px;border-radius:9px;font-size:12px;display:none}
+@media(max-width:700px){.shell{padding:15px}.top{align-items:flex-start;flex-direction:column}.board-head,.board-row{grid-template-columns:125px repeat(3,minmax(190px,1fr))}}
+</style></head><body><div class="shell">
+<header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
+<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계가 변경되고, 다른 구성원의 행으로 옮기면 담당자도 변경됩니다. 완료 항목은 메인 캘린더의 TODO에도 완료로 반영됩니다.</p>
+<div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
+</div><div class="toast" id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;
+const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'done',label:'완료'}];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
+async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');render(data)}catch(e){toast(e.message)}}
+function render(data){const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
+for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
+for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task '+(t.priority==='high'?'high':'')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div><div class="task-meta"><span>'+({high:'높음',normal:'보통',low:'낮음'}[t.priority]||'보통')+'</span><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
+html+='</div>'}board.innerHTML=html;
+board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
+board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast('업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
+}
+$('reload').onclick=load;load();
 </script></body></html>'''
