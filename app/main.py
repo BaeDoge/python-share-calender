@@ -41,7 +41,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.2.1")
+app = FastAPI(title="사내 공용 캘린더", version="0.2.2")
 
 
 def db() -> sqlite3.Connection:
@@ -422,24 +422,74 @@ def home() -> str:
 def identify_user(payload: IdentifyIn, request: Request):
     ip = client_ip(request)
     now = datetime.now().isoformat(timespec="seconds")
+    palette = ["#2563eb", "#059669", "#d97706", "#9333ea", "#db2777", "#0891b2", "#475569", "#0f766e"]
+
     with db() as conn:
         existing = conn.execute("SELECT * FROM users WHERE id=?", (payload.user_id,)).fetchone()
         if existing:
-            conn.execute("UPDATE users SET ip=?,last_seen=? WHERE id=?", (ip, now, payload.user_id))
-            result = {"id": existing["id"], "display_name": existing["display_name"],
-                      "color": existing["color"], "needs_name": False}
+            conn.execute(
+                "UPDATE users SET ip=?,last_seen=? WHERE id=?",
+                (ip, now, payload.user_id),
+            )
+            result = {
+                "id": existing["id"],
+                "display_name": existing["display_name"],
+                "color": existing["color"],
+                "needs_name": False,
+            }
         else:
-            # 브라우저 저장소가 초기화된 경우에도 같은 IP에 사용자 1명만 있으면 재사용
-            same_ip = conn.execute("SELECT * FROM users WHERE ip=? ORDER BY last_seen DESC", (ip,)).fetchall()
+            # 브라우저 저장소가 초기화된 경우 같은 IP에 사용자가 한 명뿐이면 기존 사용자를 재사용합니다.
+            same_ip = conn.execute(
+                "SELECT * FROM users WHERE ip=? ORDER BY last_seen DESC",
+                (ip,),
+            ).fetchall()
+
             if len(same_ip) == 1:
                 row = same_ip[0]
-                conn.execute("UPDATE users SET last_seen=? WHERE id=?", (now, row["id"]))
-                result = {"id": row["id"], "display_name": row["display_name"],
-                          "color": row["color"], "needs_name": False}
+                conn.execute(
+                    "UPDATE users SET last_seen=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                result = {
+                    "id": row["id"],
+                    "display_name": row["display_name"],
+                    "color": row["color"],
+                    "needs_name": False,
+                }
+            elif payload.display_name and payload.display_name.strip():
+                # 저장된 이름이 있지만 UUID가 DB에 없는 경우 반드시 신규 사용자를 DB에 생성합니다.
+                # 이전 버전은 needs_name=False만 반환하고 INSERT를 누락해 이후 API가 401을 반환했습니다.
+                count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                color = palette[count % len(palette)]
+                display_name = payload.display_name.strip()
+                conn.execute(
+                    "INSERT INTO users(id,display_name,ip,color,created_at,last_seen) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (payload.user_id, display_name, ip, color, now, now),
+                )
+                result = {
+                    "id": payload.user_id,
+                    "display_name": display_name,
+                    "color": color,
+                    "needs_name": False,
+                }
             else:
-                result = {"id": payload.user_id, "display_name": payload.display_name or "",
-                          "color": "#2563eb", "needs_name": not bool(payload.display_name)}
-    audit(request, result["id"], "USER_IDENTIFY", display_name=result["display_name"], reused=not result["needs_name"])
+                # 사용자 이름이 없으면 화면에서 입력받은 뒤 /api/users에서 등록합니다.
+                result = {
+                    "id": payload.user_id,
+                    "display_name": "",
+                    "color": palette[0],
+                    "needs_name": True,
+                }
+
+    audit(
+        request,
+        result["id"] if not result["needs_name"] else None,
+        "USER_IDENTIFY",
+        display_name=result["display_name"],
+        reused=not result["needs_name"] and result["id"] != payload.user_id,
+        needs_name=result["needs_name"],
+    )
     return result
 
 
@@ -861,6 +911,26 @@ function renderTodos(){let filter=$('todoFilter').value,list=todos.filter(t=>fil
 async function runSearch(){let params=new URLSearchParams({q:$('searchQuery').value,category:$('searchCategory').value,environment:$('searchEnvironment').value,from_date:$('searchFrom').value,to_date:$('searchTo').value});let results=await api(`/api/events/search?${params}`);$('searchResults').innerHTML=results.map(e=>`<div class="event-row"><div class="event-color" style="background:${e.color}"></div><div class="event-row-main"><div>${categoryTag(e)}</div><div class="event-row-title">${esc(e.title)}</div><div class="event-row-meta">${e.start_at.replace('T',' ')}${e.end_at?' ~ '+e.end_at.replace('T',' '):''} · ${esc(e.display_name)}${e.assignee?' · '+esc(e.assignee):''}${e.ticket_no?' · '+esc(e.ticket_no):''}</div></div><button data-search-edit="${e.id}">열기</button></div>`).join('')||'<p class="muted" style="font-size:12px">검색 결과가 없습니다.</p>';$('searchResults').querySelectorAll('[data-search-edit]').forEach(b=>b.onclick=()=>{let e=results.find(x=>x.id==b.dataset.searchEdit);closeModal('searchModal');openEvent(e)})}
 $('searchBtn').onclick=()=>{$('searchQuery').value=$('searchInput').value;openModal('searchModal');runSearch()};$('searchInput').onkeydown=e=>{if(e.key==='Enter')$('searchBtn').click()};$('runSearch').onclick=()=>runSearch();$('searchQuery').onkeydown=e=>{if(e.key==='Enter')runSearch()};
 $('settingsBtn').onclick=()=>{$('displayName').value=user.display_name;openModal('settingsModal')};$('saveSettings').onclick=async()=>{try{let name=$('displayName').value.trim();if(!name)throw Error('이름을 입력하세요.');user=await api('/api/users/me',{method:'PATCH',body:JSON.stringify({display_name:name})});localStorage.setItem('company-calendar-name',name);$('who').textContent=name;closeModal('settingsModal');showToast('사용자 이름을 변경했습니다.')}catch(e){showToast(e.message)}};
-async function start(){try{await identify();await refresh()}catch(e){showToast(e.message)}}
+async function start(){
+ try{
+  await identify();
+  await refresh();
+ }catch(e){
+  // DB 초기화/이전 등으로 브라우저에 저장된 UUID가 서버에 없으면 한 번 새 ID로 재등록합니다.
+  if(String(e.message||'').includes('등록되지 않은 사용자')){
+   localStorage.removeItem('company-calendar-user');
+   try{
+    await identify();
+    await refresh();
+    showToast('사용자 정보를 다시 등록했습니다.');
+    return;
+   }catch(retryError){
+    showToast(retryError.message);
+    return;
+   }
+  }
+  showToast(e.message);
+ }
+}
 start();
 </script></body></html>'''
