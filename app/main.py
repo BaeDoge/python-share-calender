@@ -1092,3 +1092,33 @@ async function start(){
 }
 start();
 </script></body></html>'''
+
+
+KANBAN_HTML = r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>팀 TODO 칸반 보드</title>
+<style>
+:root{font-family:Inter,"Pretendard","Noto Sans KR","Malgun Gothic",system-ui,sans-serif;color:#172033;background:#f4f6fa;--line:#e6eaf2;--muted:#758096}
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa}.shell{max-width:1700px;margin:auto;padding:24px 28px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}.top h1{font-size:21px;margin:0}.top p{font-size:12px;color:var(--muted);margin:5px 0 0}.top-actions{display:flex;gap:8px;align-items:center}a,button{font:inherit}a{color:#344054;text-decoration:none;border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;font-size:12px}button{border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;cursor:pointer}.board-note{font-size:12px;color:#69758b;margin:0 0 14px}.board-scroll{overflow:auto;border:1px solid var(--line);border-radius:13px;background:white}.board{min-width:900px}.board-head,.board-row{display:grid;grid-template-columns:170px repeat(3,minmax(220px,1fr))}.board-head{position:sticky;top:0;z-index:2;background:#f8faff;border-bottom:1px solid var(--line)}.board-head>div{padding:14px 13px;font-size:12px;font-weight:750;border-right:1px solid var(--line)}.board-head>div:nth-child(2){color:#64748b}.board-head>div:nth-child(3){color:#3563c9}.board-head>div:nth-child(4){color:#16836d}.board-row{border-bottom:1px solid var(--line)}.board-row:last-child{border-bottom:0}.member{padding:14px 12px;border-right:1px solid var(--line);background:#fbfcfe;display:flex;align-items:flex-start;gap:8px;font-size:12px;font-weight:700}.member-count{display:block;font-size:10px;color:#8a94a6;font-weight:500;margin-top:4px}.dropzone{min-height:112px;padding:9px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:8px;transition:background .12s}.dropzone:last-child{border-right:0}.dropzone.drag-over{background:#eef3ff;outline:2px dashed #8ba3ed;outline-offset:-4px}.task{background:white;border:1px solid #e5eaf2;border-left:3px solid #9aa7bd;border-radius:9px;padding:10px 11px;box-shadow:0 2px 7px rgba(20,35,65,.04);cursor:grab}.task:active{cursor:grabbing}.task.high{border-left-color:#d97757}.task-title{font-size:12px;font-weight:700;line-height:1.5;overflow-wrap:anywhere}.task-meta{font-size:10px;color:#7c879b;margin-top:7px;display:flex;justify-content:space-between;gap:6px}.empty{color:#a0a8b7;font-size:10px;text-align:center;padding:12px 0}.status-count{font-size:10px;color:#8b95a7;font-weight:500;margin-left:5px}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202b43;color:white;padding:10px 15px;border-radius:9px;font-size:12px;display:none}
+@media(max-width:700px){.shell{padding:15px}.top{align-items:flex-start;flex-direction:column}.board-head,.board-row{grid-template-columns:125px repeat(3,minmax(190px,1fr))}}
+</style></head><body><div class="shell">
+<header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
+<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계가 변경되고, 다른 구성원의 행으로 옮기면 담당자도 변경됩니다. 완료 항목은 메인 캘린더의 TODO에도 완료로 반영됩니다.</p>
+<div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
+</div><div class="toast" id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;
+const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'done',label:'완료'}];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
+async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');render(data)}catch(e){toast(e.message)}}
+function render(data){const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
+for(const member of data.users){const memberTodos=data.todos.filter(t=>t.owner_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
+for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task '+(t.priority==='high'?'high':'')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div><div class="task-meta"><span>'+({high:'높음',normal:'보통',low:'낮음'}[t.priority]||'보통')+'</span><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
+html+='</div>'}board.innerHTML=html;
+board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
+board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast('업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
+}
+$('reload').onclick=load;load();
+</script></body></html>'''
