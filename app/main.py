@@ -213,7 +213,7 @@ def audit(request: Request, user_id: str | None, action: str, **details: Any) ->
             if user_id:
                 row = conn.execute("SELECT display_name FROM users WHERE id=?", (user_id,)).fetchone()
                 if row:
-                    actor = f"{row['display_name']}[{user_id}]"
+                    actor = row["display_name"]
             safe_details = json.dumps(details, ensure_ascii=False, default=str)
             logger.info("IP=%s | USER=%s | ACTION=%s | DETAILS=%s", ip, actor, action, safe_details)
             conn.execute(
