@@ -724,7 +724,7 @@ def today_tasks(request: Request, x_user_id: str | None = Header(default=None)):
             WHERE e.deleted_at IS NULL AND e.category <> '휴가'
               AND date(e.start_at) <= date(?)
               AND date(COALESCE(e.end_at,e.start_at)) >= date(?)
-              AND (e.owner_id=? OR COALESCE(e.assignee,'')=?)
+              AND (e.owner_id=? OR (e.visibility='shared' AND COALESCE(e.assignee,'')=?))
             ORDER BY e.all_day DESC,e.start_at,e.id
         """, (today, today, user["id"], user["display_name"])).fetchall()
         todo_rows = conn.execute("""SELECT t.id,t.title,t.note,t.due_date,t.status
