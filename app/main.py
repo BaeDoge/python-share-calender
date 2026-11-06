@@ -44,7 +44,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.6.0")
+app = FastAPI(title="사내 공용 캘린더", version="0.6.1")
 
 
 def db() -> sqlite3.Connection:
@@ -155,6 +155,8 @@ def init_db() -> None:
         todo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
         if "note" not in todo_columns:
             conn.execute("ALTER TABLE todos ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        if "color" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN color TEXT NOT NULL DEFAULT '#9aa7bd'")
         if "status" not in todo_columns:
             conn.execute("ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'")
         if "assignee_id" not in todo_columns:
@@ -213,6 +215,7 @@ class TodoUpdateIn(BaseModel):
     note: str = Field(default="", max_length=2000)
     assignee_id: str = Field(min_length=8, max_length=80)
     visibility: str = "personal"
+    color: str | None = Field(default=None, max_length=7)
 
 
 class ParseIn(BaseModel):
@@ -1026,13 +1029,15 @@ def update_todo(todo_id: int, payload: TodoUpdateIn, request: Request,
         raise HTTPException(422, "TODO 제목을 입력해야 합니다.")
     if payload.visibility not in ("personal", "shared"):
         raise HTTPException(422, "공개 범위가 올바르지 않습니다.")
+    if payload.color is not None and not re.fullmatch(r"#[0-9a-fA-F]{6}", payload.color):
+        raise HTTPException(422, "TODO 색상 값이 올바르지 않습니다.")
     if payload.due_date:
         try:
             date.fromisoformat(payload.due_date)
         except ValueError as exc:
             raise HTTPException(422, "마감일 형식이 올바르지 않습니다.") from exc
     with db() as conn:
-        row = conn.execute("SELECT owner_id,visibility,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
+        row = conn.execute("SELECT owner_id,visibility,deleted_at,color FROM todos WHERE id=?", (todo_id,)).fetchone()
         if not row or row["deleted_at"]:
             raise HTTPException(404, "TODO를 찾을 수 없습니다.")
         if row["owner_id"] != user["id"] and row["visibility"] != "shared":
@@ -1042,8 +1047,8 @@ def update_todo(todo_id: int, payload: TodoUpdateIn, request: Request,
             raise HTTPException(404, "담당자를 찾을 수 없습니다.")
         if payload.visibility == "personal" and payload.assignee_id != user["id"]:
             raise HTTPException(422, "개인 TODO의 담당자는 본인만 지정할 수 있습니다.")
-        conn.execute("UPDATE todos SET title=?,due_date=?,note=?,assignee_id=?,visibility=? WHERE id=?",
-                     (title, payload.due_date, payload.note.strip(), payload.assignee_id, payload.visibility, todo_id))
+        conn.execute("UPDATE todos SET title=?,due_date=?,note=?,assignee_id=?,visibility=?,color=COALESCE(?,color) WHERE id=?",
+                     (title, payload.due_date, payload.note.strip(), payload.assignee_id, payload.visibility, payload.color, todo_id))
     audit(request, user["id"], "TODO_UPDATE", todo_id=todo_id, title=title)
     return {"ok": True}
 
@@ -1071,7 +1076,7 @@ def get_kanban_data(request: Request, x_user_id: str | None = Header(default=Non
     user = get_user(request, x_user_id)
     with db() as conn:
         users = conn.execute("SELECT id,display_name FROM users WHERE deleted_at IS NULL AND display_name <> '관리자' ORDER BY display_name COLLATE NOCASE,id").fetchall()
-        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.note,t.completed,t.status,
+        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.note,t.color,t.completed,t.status,
                                        t.owner_id,COALESCE(t.assignee_id,t.owner_id) AS assignee_id,
                                        t.created_at,u.display_name AS assignee_name
                                 FROM todos t JOIN users u ON u.id=COALESCE(t.assignee_id,t.owner_id)
@@ -1387,30 +1392,62 @@ KANBAN_HTML = r'''<!doctype html>
 <style>
 :root{font-family:Inter,"Pretendard","Noto Sans KR","Malgun Gothic",system-ui,sans-serif;color:#172033;background:#f4f6fa;--line:#e6eaf2;--muted:#758096}
 *{box-sizing:border-box}body{margin:0;background:#f4f6fa}.shell{max-width:1700px;margin:auto;padding:24px 28px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}.top h1{font-size:21px;margin:0}.top p{font-size:12px;color:var(--muted);margin:5px 0 0}.top-actions{display:flex;gap:8px;align-items:center}a,button{font:inherit}a{color:#344054;text-decoration:none;border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;font-size:12px}button{border:1px solid #dce2ed;border-radius:9px;padding:9px 12px;background:white;cursor:pointer}.board-note{font-size:12px;color:#69758b;margin:0 0 14px}.board-scroll{overflow:auto;border:1px solid var(--line);border-radius:13px;background:white}.board{min-width:900px}.board-head,.board-row{display:grid;grid-template-columns:170px repeat(5,minmax(190px,1fr))}.board-head{position:sticky;top:0;z-index:2;background:#f8faff;border-bottom:1px solid var(--line)}.board-head>div{padding:14px 13px;font-size:12px;font-weight:750;border-right:1px solid var(--line)}.board-head>div:nth-child(2){color:#64748b}.board-head>div:nth-child(3){color:#3563c9}.board-head>div:nth-child(4){color:#b7791f}.board-head>div:nth-child(5){color:#16836d}.board-head>div:nth-child(6){color:#16836d}.board-head>div:nth-child(7){color:#b84b58}.dropzone[data-status="trash"]{background:#fffafa}.dropzone[data-status="trash"] .empty{color:#c18c8c}.board-row{border-bottom:1px solid var(--line)}.board-row:last-child{border-bottom:0}.member{padding:14px 12px;border-right:1px solid var(--line);background:#fbfcfe;display:flex;align-items:flex-start;gap:8px;font-size:12px;font-weight:700}.member-count{display:block;font-size:10px;color:#8a94a6;font-weight:500;margin-top:4px}.dropzone{min-height:112px;padding:9px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:8px;transition:background .12s}.dropzone:last-child{border-right:0}.dropzone.drag-over{background:#eef3ff;outline:2px dashed #8ba3ed;outline-offset:-4px}.task{background:white;border:1px solid #e5eaf2;border-left:3px solid #9aa7bd;border-radius:9px;padding:10px 11px;box-shadow:0 2px 7px rgba(20,35,65,.04);cursor:grab}.task:active{cursor:grabbing}.task.high{border-left-color:#d97757}.task-title{font-size:12px;font-weight:700;line-height:1.5;overflow-wrap:anywhere}.task-meta{font-size:10px;color:#7c879b;margin-top:7px;display:flex;justify-content:space-between;gap:6px}.empty{color:#a0a8b7;font-size:10px;text-align:center;padding:12px 0}.status-count{font-size:10px;color:#8b95a7;font-weight:500;margin-left:5px}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202b43;color:white;padding:10px 15px;border-radius:9px;font-size:12px;display:none}
+.board-add{padding:12px;background:#fff;border:1px solid var(--line);border-radius:13px;box-shadow:0 3px 12px rgba(25,40,70,.035)}
+.board-add-row{display:flex;gap:9px;align-items:center}
+.board-add input{min-width:0;width:100%;height:42px;padding:0 13px;border:1px solid #dce3ee;border-radius:9px;background:#fbfcff;color:#172033;font:inherit;font-size:13px;outline:none}
+.board-add input:focus,.edit-form input:focus,.edit-form select:focus,.edit-form textarea:focus{border-color:#7898e8;box-shadow:0 0 0 3px rgba(84,125,220,.12);background:#fff}
+.board-add button.primary,.edit-actions button.primary{border:0;background:#315fc5;color:white;font-weight:700}
+.board-add button{padding:0 18px;font-size:12px;white-space:nowrap}
+.task{position:relative;padding:11px 34px 11px 11px}
+.edit-kanban-todo{position:absolute;right:7px;top:7px;width:24px;height:24px;padding:0;display:grid;place-items:center;border:1px solid transparent;border-radius:7px;background:transparent;color:#8792a6;font-size:17px;line-height:1;opacity:.72}
+.edit-kanban-todo:hover{background:#edf2ff;border-color:#dce5ff;color:#315fc5;opacity:1}
+.modal{position:fixed;inset:0;z-index:10000;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.48);backdrop-filter:blur(3px)}
+.modal.is-open{display:flex}
+.dialog{width:min(100%,520px);max-height:min(90vh,760px);overflow:auto;background:#fff;border:1px solid rgba(255,255,255,.7);border-radius:18px;padding:23px;box-shadow:0 24px 80px rgba(10,20,45,.25);animation:kanbanModalIn .16s ease-out}
+@keyframes kanbanModalIn{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
+.dialog-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.dialog-head h2{margin:0;font-size:18px;letter-spacing:-.4px}
+.dialog .close{width:32px;height:32px;padding:0;border:0;background:#f2f4f8;color:#667085;font-size:20px}
+.edit-form{display:grid;gap:15px}
+.edit-form .field{display:grid;gap:7px}
+.edit-form label{font-size:12px;font-weight:700;color:#475467}
+.edit-form input,.edit-form select,.edit-form textarea{width:100%;min-height:42px;padding:10px 12px;border:1px solid #dce3ee;border-radius:9px;background:#fbfcff;color:#172033;font:inherit;font-size:13px;outline:none}
+.edit-form textarea{resize:vertical;min-height:100px;line-height:1.55}
+.edit-form input[type=color]{width:100%;height:44px;min-height:44px;padding:5px;cursor:pointer}
+.color-field{display:grid;grid-template-columns:1fr 52px;gap:10px;align-items:center}
+.color-help{font-size:11px;color:#8792a6}
+.edit-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:5px}
+.edit-actions button{min-width:88px;padding:10px 14px;font-size:12px}
+body.modal-open{overflow:hidden}
+@media(max-width:520px){.dialog{padding:18px;border-radius:15px}.board-add{padding:9px}.board-add button{padding:0 12px}.board-add-row{gap:6px}}
+
 @media(max-width:700px){.shell{padding:15px}.top{align-items:flex-start;flex-direction:column}.board-head,.board-row{grid-template-columns:125px repeat(3,minmax(190px,1fr))}}
 </style></head><body><div class="shell">
 <header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
 <p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계와 담당자를 변경할 수 있습니다. 완료됨은 메인 TODO에 완료로 반영됩니다. 휴지통으로 이동한 항목은 관리자 페이지에서 복구할 수 있습니다.</p>
-<section class="board-add" style="display:flex;gap:8px;margin-bottom:14px"><input id="newTodoTitle" maxlength="200" placeholder="새 TODO 제목" style="flex:1"><button id="addKanbanTodo" class="primary">TODO 추가</button></section>
+<section class="board-add"><div class="board-add-row"><input id="newTodoTitle" maxlength="200" placeholder="새 TODO 제목을 입력하고 Enter를 누르세요"><button id="addKanbanTodo" class="primary">+ TODO 추가</button></div></section>
 <div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
-</div><div class="modal" id="kanbanTodoEditModal"><div class="dialog"><div class="dialog-head"><h2>TODO 수정</h2><button class="close" data-close="kanbanTodoEditModal">×</button></div><div class="field"><label>할 일 *</label><input id="kanbanEditTitle" maxlength="200"></div><div class="field"><label>담당자</label><select id="kanbanEditAssignee"></select></div><div class="field"><label>마감일</label><input id="kanbanEditDue" type="date"></div><div class="field"><label>비고</label><textarea id="kanbanEditNote" rows="4" maxlength="2000"></textarea></div><div class="dialog-actions"><button data-close="kanbanTodoEditModal">취소</button><button id="saveKanbanTodoEdit" class="primary">변경 저장</button></div></div></div>
+</div><div class="modal" id="kanbanTodoEditModal" role="dialog" aria-modal="true" aria-labelledby="kanbanEditHeading"><div class="dialog"><div class="dialog-head"><h2 id="kanbanEditHeading">TODO 수정</h2><button type="button" class="close" data-close="kanbanTodoEditModal" aria-label="닫기">×</button></div><div class="edit-form"><div class="field"><label for="kanbanEditTitle">할 일 제목</label><input id="kanbanEditTitle" maxlength="200" placeholder="해야 할 일을 입력하세요"></div><div class="field"><label for="kanbanEditAssignee">담당자</label><select id="kanbanEditAssignee"></select></div><div class="field"><label for="kanbanEditDue">마감일</label><input id="kanbanEditDue" type="date"></div><div class="field"><label for="kanbanEditNote">비고</label><textarea id="kanbanEditNote" rows="4" maxlength="2000" placeholder="추가 설명이나 참고사항을 입력하세요"></textarea></div><div class="field"><label for="kanbanEditColor">카드 색상</label><div class="color-field"><span class="color-help">칸반 카드 왼쪽 강조 색상을 선택합니다.</span><input id="kanbanEditColor" type="color" value="#9aa7bd" aria-label="TODO 카드 색상"></div></div><div class="edit-actions"><button type="button" data-close="kanbanTodoEditModal">취소</button><button type="button" id="saveKanbanTodoEdit" class="primary">변경 저장</button></div></div></div></div>
 <div class="toast" id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;
 const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'blocked',label:'보류됨'},{id:'done',label:'완료됨'},{id:'trash',label:'휴지통'}];let kanbanUsers=[];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>{const modal=document.getElementById(b.dataset.close);if(modal)modal.style.display='none'});
+function closeKanbanTodoEdit(){const modal=$('kanbanTodoEditModal');modal.classList.remove('is-open');document.body.classList.remove('modal-open')}
+document.querySelectorAll('[data-close]').forEach(b=>b.onclick=closeKanbanTodoEdit);
+$('kanbanTodoEditModal').addEventListener('click',e=>{if(e.target===$('kanbanTodoEditModal'))closeKanbanTodoEdit()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('kanbanTodoEditModal').classList.contains('is-open'))closeKanbanTodoEdit()});
 function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
 async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');kanbanUsers=data.users;render(data)}catch(e){toast(e.message)}}
 $('newTodoTitle').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('addKanbanTodo').click()}});
 $('addKanbanTodo').onclick=async()=>{try{const title=$('newTodoTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/kanban/todos',{method:'POST',body:JSON.stringify({title,visibility:'shared'})});$('newTodoTitle').value='';await load();toast('TODO를 추가했습니다.')}catch(e){toast(e.message)}};
 let kanbanTodos=[];
-function openKanbanTodoEdit(id){const t=kanbanTodos.find(x=>x.id===id);if(!t)return;$('kanbanEditTitle').value=t.title;$('kanbanEditAssignee').innerHTML=kanbanUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');$('kanbanEditAssignee').value=t.assignee_id;$('kanbanEditDue').value=t.due_date||'';$('kanbanEditNote').value=t.note||'';$('saveKanbanTodoEdit').dataset.todoId=String(id);$('kanbanTodoEditModal').style.display='flex'}
-$('saveKanbanTodoEdit').onclick=async()=>{try{const id=Number($('saveKanbanTodoEdit').dataset.todoId),title=$('kanbanEditTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('kanbanEditDue').value||null,note:$('kanbanEditNote').value,assignee_id:$('kanbanEditAssignee').value,visibility:'shared'})});$('kanbanTodoEditModal').style.display='none';await load();toast('TODO를 수정했습니다.')}catch(e){toast(e.message)}};
+function openKanbanTodoEdit(id){const t=kanbanTodos.find(x=>x.id===id);if(!t)return;$('kanbanEditTitle').value=t.title;$('kanbanEditAssignee').innerHTML=kanbanUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');$('kanbanEditAssignee').value=t.assignee_id;$('kanbanEditDue').value=t.due_date||'';$('kanbanEditNote').value=t.note||'';$('kanbanEditColor').value=/^#[0-9a-fA-F]{6}$/.test(t.color||'')?t.color:'#9aa7bd';$('saveKanbanTodoEdit').dataset.todoId=String(id);$('kanbanTodoEditModal').classList.add('is-open');document.body.classList.add('modal-open');setTimeout(()=>$('kanbanEditTitle').focus(),40)}
+$('saveKanbanTodoEdit').onclick=async()=>{try{const id=Number($('saveKanbanTodoEdit').dataset.todoId),title=$('kanbanEditTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('kanbanEditDue').value||null,note:$('kanbanEditNote').value,assignee_id:$('kanbanEditAssignee').value,visibility:'shared',color:$('kanbanEditColor').value})});closeKanbanTodoEdit();await load();toast('TODO를 수정했습니다.')}catch(e){toast(e.message)}};
 function render(data){kanbanTodos=data.todos;const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
  for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
- for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div><button type="button" class="edit-kanban-todo" data-edit-todo="'+t.id+'">수정</button></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
+ for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" style="border-left-color:'+esc(/^#[0-9a-fA-F]{6}$/.test(t.color||'')?t.color:'#9aa7bd')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div><button type="button" class="edit-kanban-todo" data-edit-todo="'+t.id+'" aria-label="TODO 수정" title="TODO 수정">✎</button></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
  html+='</div>'}board.innerHTML=html;
 board.querySelectorAll('[data-edit-todo]').forEach(button=>button.addEventListener('click',e=>{e.stopPropagation();openKanbanTodoEdit(Number(button.dataset.editTodo))}));
 board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
