@@ -1205,7 +1205,7 @@ function getBrowserId(){let id=localStorage.getItem('company-calendar-user');if(
 async function identify(){
  let id=getBrowserId(),savedName=localStorage.getItem('company-calendar-name')||null;
  let result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});
- if(result.deleted){id=createBrowserUuid();localStorage.setItem('company-calendar-user',id);result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});}
+ if(result.deleted){localStorage.removeItem('company-calendar-user');localStorage.removeItem('company-calendar-name');throw Error('해당 계정은 비활성화되었습니다. 관리자에게 문의하세요.');}
  if(result.needs_name){
   let name='';
   while(!name){
