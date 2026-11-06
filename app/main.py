@@ -44,7 +44,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.5.0")
+app = FastAPI(title="사내 공용 캘린더", version="0.6.0")
 
 
 def db() -> sqlite3.Connection:
@@ -715,6 +715,27 @@ def list_events(start: str, end: str, request: Request,
     return result
 
 
+@app.get("/api/today-tasks")
+def today_tasks(request: Request, x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    today = date.today().isoformat()
+    with db() as conn:
+        event_rows = conn.execute(event_query_select() + """
+            WHERE e.deleted_at IS NULL AND e.category <> '휴가'
+              AND date(e.start_at) <= date(?)
+              AND date(COALESCE(e.end_at,e.start_at)) >= date(?)
+              AND (e.owner_id=? OR COALESCE(e.assignee,'')=?)
+            ORDER BY e.all_day DESC,e.start_at,e.id
+        """, (today, today, user["id"], user["display_name"])).fetchall()
+        todo_rows = conn.execute("""SELECT t.id,t.title,t.note,t.due_date,t.status
+            FROM todos t JOIN users owner ON owner.id=t.owner_id
+            WHERE t.deleted_at IS NULL AND t.status='in_progress'
+              AND owner.deleted_at IS NULL AND (t.owner_id=? OR t.assignee_id=?)
+            ORDER BY t.due_date IS NULL,t.due_date,t.id DESC""", (user["id"], user["id"])).fetchall()
+        event_items = [event_to_dict(row, conn) for row in event_rows]
+    return {"date": today, "events": event_items, "todos": [dict(row) for row in todo_rows]}
+
+
 @app.get("/api/events/search")
 def search_events(request: Request, q: str = "", category: str = "", environment: str = "",
                   from_date: str = "", to_date: str = "",
@@ -1011,11 +1032,11 @@ def update_todo(todo_id: int, payload: TodoUpdateIn, request: Request,
         except ValueError as exc:
             raise HTTPException(422, "마감일 형식이 올바르지 않습니다.") from exc
     with db() as conn:
-        row = conn.execute("SELECT owner_id,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
+        row = conn.execute("SELECT owner_id,visibility,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
         if not row or row["deleted_at"]:
             raise HTTPException(404, "TODO를 찾을 수 없습니다.")
-        if row["owner_id"] != user["id"]:
-            raise HTTPException(403, "본인이 등록한 TODO만 수정할 수 있습니다.")
+        if row["owner_id"] != user["id"] and row["visibility"] != "shared":
+            raise HTTPException(403, "본인이 등록한 개인 TODO만 수정할 수 있습니다.")
         assignee = conn.execute("SELECT id FROM users WHERE id=? AND deleted_at IS NULL", (payload.assignee_id,)).fetchone()
         if not assignee:
             raise HTTPException(404, "담당자를 찾을 수 없습니다.")
@@ -1153,11 +1174,12 @@ HTML = r'''<!doctype html>
  <main class="panel calendar-panel">
   <div class="toolbar"><div class="toolbar-left"><button class="icon-btn" id="prev" aria-label="이전">‹</button><button id="today">오늘</button><button class="icon-btn" id="next" aria-label="다음">›</button></div><h2 id="periodTitle"></h2><div class="toolbar-right"><div class="view-switch"><button id="monthView" class="active">월간</button><button id="weekView">주간</button></div><button id="addEvent" class="primary">＋ 일정</button></div></div>
   <div id="calendar" class="calendar"></div>
+  <section class="today-tasks" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px"><div class="section-title"><span>오늘 해야 할 일</span><span id="todayTaskDate" class="natural-help"></span></div><div id="todayTaskList" class="event-list"><p class="muted">오늘 할 일을 불러오는 중...</p></div></section>
   <p class="calendar-hint">날짜를 누르면 해당 날짜 상세 일정이 열립니다. 빈 날짜를 두 번 누르거나 '+ 일정'으로 일정을 등록할 수 있습니다.</p>
  </main>
  <aside class="panel side-panel">
   <section class="side-section"><div class="side-label">QUICK ADD</div><h3 class="section-title" style="margin-top:5px">자연어로 일정 등록</h3><div class="field"><input id="naturalInput" placeholder="예: 다음 주 수요일 2시부터 3시 회의"></div><button class="primary full" id="parseBtn">일정 분석하기</button><div class="parse-result" id="parseResult"></div><p class="natural-help">오전/오후를 생략한 1~11시는 오후로 해석합니다. 분석 결과 확인 후 저장하세요.</p></section>
-  <section class="side-section"><div class="side-label">MY TASKS</div><div class="section-title" style="margin-top:5px"><span>Todo</span><select id="todoFilter" class="todo-filter" style="width:auto"><option value="all">전체</option><option value="open">진행 중</option><option value="done">완료</option></select></div><div class="field"><input id="todoTitle" placeholder="새로운 할 일을 입력하세요"></div><div class="inline"><input id="todoDue" type="date" aria-label="마감일"><select id="todoScope" aria-label="공개 범위"><option value="personal">개인</option><option value="shared">공용</option></select></div><div class="field"><label>담당자</label><select id="todoAssignee"></select></div><div class="field"><label>비고</label><textarea id="todoNote" rows="2" maxlength="2000" placeholder="참고 사항이나 상세 내용을 입력하세요"></textarea></div><button id="todoAdd" class="full">Todo 추가</button><div id="todoList" class="todo-list"></div><div class="inline" style="align-items:center;justify-content:space-between;margin-top:8px"><button id="todoPrev" type="button">이전</button><span id="todoPageInfo" class="natural-help"></span><button id="todoNext" type="button">다음</button></div><p class="natural-help">완료한 Todo는 자동 삭제되지 않습니다. 필요할 때 휴지통으로 직접 삭제할 수 있습니다.</p></section>
+  <section class="side-section"><div class="side-label">MY TASKS</div><div class="section-title" style="margin-top:5px"><span>Todo</span><select id="todoFilter" class="todo-filter" style="width:auto"><option value="all">전체</option><option value="open">진행 중</option><option value="done">완료</option></select></div><div class="field"><input id="todoTitle" placeholder="새로운 할 일을 입력하세요"></div><div class="inline"><input id="todoDue" type="date" aria-label="마감일"><select id="todoScope" aria-label="공개 범위"><option value="shared" selected>공용</option><option value="personal">개인</option></select></div><div class="field"><label>비고</label><textarea id="todoNote" rows="2" maxlength="2000" placeholder="참고 사항이나 상세 내용을 입력하세요"></textarea></div><button id="todoAdd" class="full">Todo 추가</button><div id="todoList" class="todo-list"></div><div class="inline" style="align-items:center;justify-content:space-between;margin-top:8px"><button id="todoPrev" type="button">이전</button><span id="todoPageInfo" class="natural-help"></span><button id="todoNext" type="button">다음</button></div><p class="natural-help">완료한 Todo는 자동 삭제되지 않습니다. 필요할 때 휴지통으로 직접 삭제할 수 있습니다.</p></section>
  </aside>
 </div></div>
 
@@ -1186,7 +1208,7 @@ HTML = r'''<!doctype html>
 <div class="modal" id="searchModal"><div class="dialog wide"><div class="dialog-head"><h2>일정 검색</h2><button class="close" data-close="searchModal">×</button></div>
  <div class="search-filters"><input id="searchQuery" placeholder="제목, 설명, 담당자, 작업번호"><select id="searchCategory"><option value="">모든 유형</option><option>SR</option><option>CM</option><option>회의</option><option>휴가</option><option>기타</option></select><select id="searchEnvironment"><option value="">모든 환경</option><option>Dev</option><option>Stg</option><option>Prd</option></select><input id="searchFrom" type="date" aria-label="시작 날짜"><input id="searchTo" type="date" aria-label="종료 날짜"></div>
  <button id="runSearch" class="primary" style="margin-bottom:13px">검색 실행</button><div id="searchResults" class="event-list"></div></div></div>
-<div class="modal" id="todoEditModal"><div class="dialog"><div class="dialog-head"><h2>TODO 수정</h2><button class="close" data-close="todoEditModal">×</button></div><div class="field"><label>할 일 *</label><input id="editTodoTitle" maxlength="200"></div><div class="inline"><div class="field"><label>마감일</label><input id="editTodoDue" type="date"></div><div class="field"><label>공개 범위</label><select id="editTodoScope"><option value="personal">개인</option><option value="shared">공용</option></select></div></div><div class="field"><label>담당자</label><select id="editTodoAssignee"></select></div><div class="field"><label>비고</label><textarea id="editTodoNote" rows="4" maxlength="2000"></textarea></div><div class="dialog-actions"><button data-close="todoEditModal">취소</button><button id="saveTodoEdit" class="primary">변경 저장</button></div></div></div>
+<div class="modal" id="todoEditModal"><div class="dialog"><div class="dialog-head"><h2>TODO 수정</h2><button class="close" data-close="todoEditModal">×</button></div><div class="field"><label>할 일 *</label><input id="editTodoTitle" maxlength="200"></div><div class="inline"><div class="field"><label>마감일</label><input id="editTodoDue" type="date"></div><div class="field"><label>공개 범위</label><select id="editTodoScope"><option value="personal">개인</option><option value="shared">공용</option></select></div></div><div class="field"><label>비고</label><textarea id="editTodoNote" rows="4" maxlength="2000"></textarea></div><div class="dialog-actions"><button data-close="todoEditModal">취소</button><button id="saveTodoEdit" class="primary">변경 저장</button></div></div></div>
 <div class="modal" id="settingsModal"><div class="dialog"><div class="dialog-head"><h2>사용자 설정</h2><button class="close" data-close="settingsModal">×</button></div><div class="field"><label>캘린더 표시 이름</label><input id="displayName" maxlength="30"></div><p class="settings-note">이름은 서버의 사용자 정보에 저장됩니다. 같은 브라우저로 다시 접속하면 이름을 다시 입력할 필요가 없습니다. 브라우저 저장소를 초기화한 경우에도 해당 IP에 등록 사용자가 한 명이면 기존 사용자를 연결합니다.</p><div class="dialog-actions"><button data-close="settingsModal">취소</button><button id="saveSettings" class="primary">이름 저장</button></div></div></div>
 <div class="toast" id="toast"></div>
 
@@ -1268,7 +1290,8 @@ function weekDraw(){const start=weekStart(cursor),end=new Date(start);end.setDat
  $('calendar').querySelectorAll('[data-day-header]').forEach(el=>el.onclick=()=>openDay(el.dataset.dayHeader));
 }
 function draw(){if(viewMode==='month')monthDraw();else weekDraw()}
-async function refresh(){const start=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth(),1):weekStart(cursor);const end=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth()+1,7):new Date(weekStart(cursor).getTime()+6*86400000);start.setDate(start.getDate()-7);end.setDate(end.getDate()+7);events=await api(`/api/events?start=${dateKey(start)}&end=${dateKey(end)}`);draw();await loadTodos()}
+async function refresh(){const start=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth(),1):weekStart(cursor);const end=viewMode==='month'?new Date(cursor.getFullYear(),cursor.getMonth()+1,7):new Date(weekStart(cursor).getTime()+6*86400000);start.setDate(start.getDate()-7);end.setDate(end.getDate()+7);events=await api(`/api/events?start=${dateKey(start)}&end=${dateKey(end)}`);draw();await loadTodos();await loadTodayTasks()}
+async function loadTodayTasks(){try{const data=await api('/api/today-tasks');$('todayTaskDate').textContent=data.date;const eventHtml=data.events.map(e=>'<button class="event-item" data-today-event="'+e.id+'" style="display:block;width:100%;text-align:left;margin-bottom:6px"><span class="pill cat-'+esc(e.category)+'">'+esc(e.category)+'</span> '+(e.all_day?'종일':esc((e.start_at||'').slice(11,16)))+' · '+esc(e.title)+'</button>').join('');const todoHtml=data.todos.map(t=>'<div class="event-item" style="margin-bottom:6px"><span class="pill">TODO</span> '+esc(t.title)+(t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':'')+'</div>').join('');$('todayTaskList').innerHTML=eventHtml+todoHtml||'<p class="muted">오늘 예정된 일정이나 진행 중인 TODO가 없습니다.</p>';$('todayTaskList').querySelectorAll('[data-today-event]').forEach(b=>b.onclick=()=>openEvent(Number(b.dataset.todayEvent)))}catch(e){$('todayTaskList').innerHTML='<p class="muted">오늘 할 일을 불러오지 못했습니다.</p>'}}
 function openNew(day=dateKey(new Date()),hour=9,focusTarget='eventTitle'){editing=null;$('eventCommentsSection').classList.add('hidden');$('eventCommentsList').innerHTML='';$('eventCommentText').value='';$('eventDialogTitle').textContent='일정 등록';$('eventTitle').value='';$('eventDesc').value='';$('eventCategory').value='기타';$('eventEnvironment').value='';$('eventAssignee').value='';$('eventTicket').value='';$('eventStart').value=`${day}T${pad(hour)}:00`;let end=new Date(`${day}T${pad(hour)}:00`);end.setHours(end.getHours()+1);$('eventEnd').value=localInput(end);$('eventAllDay').checked=false;$('eventFiles').value='';$('existingAttachments').innerHTML='';$('deleteEvent').classList.add('hidden');$('saveEvent').disabled=false;$('eventOwner').textContent='일정은 팀 전체에 공유됩니다. 본인이 등록한 일정만 수정·삭제할 수 있습니다.';updateEnvironment();openModal('eventModal');requestAnimationFrame(()=>$(focusTarget).focus())}
 function updateEnvironment(){const isSrCm=['SR','CM'].includes($('eventCategory').value);$('environmentField').classList.toggle('hidden',!isSrCm);$('srCmFields').classList.toggle('hidden',!isSrCm);if(!isSrCm){$('eventEnvironment').value='';$('eventAssignee').value='';$('eventTicket').value=''}}
 $('eventCategory').onchange=updateEnvironment;
@@ -1292,16 +1315,11 @@ $('prev').onclick=()=>{if(viewMode==='month')cursor.setMonth(cursor.getMonth()-1
 $('parseBtn').onclick=async()=>{try{if(!$('naturalInput').value.trim())throw Error('일정 내용을 입력하세요.');let parsed=await api('/api/parse',{method:'POST',body:JSON.stringify({text:$('naturalInput').value})});$('parseResult').style.display='block';$('parseResult').textContent=`분석 결과: ${parsed.date}${parsed.all_day&&parsed.end_at&&parsed.end_at.slice(0,10)!==parsed.date?' ~ '+parsed.end_at.slice(0,10):''} ${parsed.time_detected?parsed.start_at.slice(11,16):'종일'} · ${parsed.time_detected&&parsed.end_at?'종료 '+parsed.end_at.slice(11,16):''} · 제목: ${parsed.title}`;openNew(parsed.date,Number(parsed.start_at.slice(11,13)),'eventDesc');$('eventTitle').value=parsed.title;$('eventStart').value=parsed.start_at;$('eventEnd').value=parsed.end_at||'';$('eventAllDay').checked=parsed.all_day;if(parsed.all_day){$('eventStart').value=parsed.date+'T00:00';$('eventEnd').value=parsed.date+'T23:59'} }catch(e){showToast(e.message)}};
 $('naturalInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('parseBtn').click()}});
 let todoPage=0;const todoPageSize=8;let todoUsers=[];
-async function loadTodoUsers(){
- todoUsers=await api('/api/users/options');
- const options=todoUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');
- $('todoAssignee').innerHTML=options;$('editTodoAssignee').innerHTML=options;
- if(user&&todoUsers.some(u=>u.id===user.id))$('todoAssignee').value=user.id;
-}
+async function loadTodoUsers(){todoUsers=await api('/api/users/options')}
 $('todoAdd').onclick=async()=>{try{
  const title=$('todoTitle').value.trim();if(!title)throw Error('Todo 내용을 입력하세요.');
- await api('/api/todos',{method:'POST',body:JSON.stringify({title,due_date:$('todoDue').value||null,note:$('todoNote').value,assignee_id:$('todoAssignee').value||user.id,visibility:$('todoScope').value})});
- $('todoTitle').value='';$('todoDue').value='';$('todoNote').value='';showToast('Todo를 추가했습니다.');todoPage=0;await loadTodos();
+ await api('/api/todos',{method:'POST',body:JSON.stringify({title,due_date:$('todoDue').value||null,note:$('todoNote').value,assignee_id:user.id,visibility:$('todoScope').value})});
+ $('todoTitle').value='';$('todoDue').value='';$('todoNote').value='';$('todoScope').value='shared';showToast('Todo를 추가했습니다.');todoPage=0;await loadTodos();
 }catch(e){showToast(e.message)}};
 $('todoTitle').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('todoAdd').click()}});
 $('todoFilter').onchange=()=>{todoPage=0;renderTodos()};
@@ -1315,19 +1333,19 @@ async function loadTodos(){
 function openTodoEdit(id){
  const t=todos.find(x=>x.id===id);if(!t)return;
  $('editTodoTitle').value=t.title;$('editTodoDue').value=t.due_date||'';$('editTodoNote').value=t.note||'';
- $('editTodoScope').value=t.visibility;$('editTodoAssignee').value=t.assignee_id||t.owner_id;
+ $('editTodoScope').value=t.visibility;
  $('saveTodoEdit').dataset.todoId=String(id);openModal('todoEditModal');
 }
 $('saveTodoEdit').onclick=async()=>{try{
  const id=Number($('saveTodoEdit').dataset.todoId),title=$('editTodoTitle').value.trim();if(!title)throw Error('TODO 내용을 입력하세요.');
- await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('editTodoDue').value||null,note:$('editTodoNote').value,assignee_id:$('editTodoAssignee').value||user.id,visibility:$('editTodoScope').value})});
+ await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('editTodoDue').value||null,note:$('editTodoNote').value,assignee_id:todos.find(t=>t.id===id)?.assignee_id||user.id,visibility:$('editTodoScope').value})});
  closeModal('todoEditModal');showToast('TODO를 수정했습니다.');await loadTodos();
 }catch(e){showToast(e.message)}};
 function renderTodos(){
  const filter=$('todoFilter').value,list=todos.filter(t=>filter==='all'||(filter==='open'&&!t.completed)||(filter==='done'&&t.completed));
  const pages=Math.max(1,Math.ceil(list.length/todoPageSize));todoPage=Math.min(todoPage,pages-1);
  const pageItems=list.slice(todoPage*todoPageSize,(todoPage+1)*todoPageSize);
- $('todoList').innerHTML=pageItems.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · 담당: ${esc(t.assignee_name||t.display_name)} · ${t.due_date||'마감일 없음'}</div>${t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':''}</div>${t.owner_id===user.id?'<button class="todo-delete" data-edit-todo="'+t.id+'" title="TODO 수정">수정</button><button class="todo-delete" data-delete-todo="'+t.id+'" title="TODO 삭제">♲</button>':''}</div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';
+ $('todoList').innerHTML=pageItems.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · ${t.due_date||'마감일 없음'}</div>${t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':''}</div>${t.owner_id===user.id?'<button class="todo-delete" data-edit-todo="'+t.id+'" title="TODO 수정">수정</button><button class="todo-delete" data-delete-todo="'+t.id+'" title="TODO 삭제">♲</button>':''}</div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';
  $('todoPageInfo').textContent=(list.length?todoPage*todoPageSize+1:0)+'–'+Math.min((todoPage+1)*todoPageSize,list.length)+' / '+list.length+'건';
  $('todoPrev').disabled=todoPage===0;$('todoNext').disabled=todoPage>=pages-1;
  $('todoList').querySelectorAll('[data-todo]').forEach(c=>c.onchange=async()=>{try{await api(`/api/todos/${c.dataset.todo}`,{method:'PATCH'});await loadTodos()}catch(e){showToast(e.message);c.checked=!c.checked}});
@@ -1373,22 +1391,27 @@ KANBAN_HTML = r'''<!doctype html>
 </style></head><body><div class="shell">
 <header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
 <p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계와 담당자를 변경할 수 있습니다. 완료됨은 메인 TODO에 완료로 반영됩니다. 휴지통으로 이동한 항목은 관리자 페이지에서 복구할 수 있습니다.</p>
-<section class="board-add" style="display:grid;grid-template-columns:2fr 1.2fr 1fr 1.2fr auto;gap:8px;margin-bottom:14px"><input id="newTodoTitle" maxlength="200" placeholder="새 TODO 제목"><input id="newTodoNote" maxlength="2000" placeholder="비고"><input id="newTodoDue" type="date" aria-label="마감일"><select id="newTodoAssignee" aria-label="담당자"></select><button id="addKanbanTodo" class="primary">TODO 추가</button></section>
+<section class="board-add" style="display:flex;gap:8px;margin-bottom:14px"><input id="newTodoTitle" maxlength="200" placeholder="새 TODO 제목" style="flex:1"><button id="addKanbanTodo" class="primary">TODO 추가</button></section>
 <div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
-</div><div class="toast" id="toast"></div>
+</div><div class="modal" id="kanbanTodoEditModal"><div class="dialog"><div class="dialog-head"><h2>TODO 수정</h2><button class="close" data-close="kanbanTodoEditModal">×</button></div><div class="field"><label>할 일 *</label><input id="kanbanEditTitle" maxlength="200"></div><div class="field"><label>담당자</label><select id="kanbanEditAssignee"></select></div><div class="field"><label>마감일</label><input id="kanbanEditDue" type="date"></div><div class="field"><label>비고</label><textarea id="kanbanEditNote" rows="4" maxlength="2000"></textarea></div><div class="dialog-actions"><button data-close="kanbanTodoEditModal">취소</button><button id="saveKanbanTodoEdit" class="primary">변경 저장</button></div></div></div>
+<div class="toast" id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;
 const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'blocked',label:'보류됨'},{id:'done',label:'완료됨'},{id:'trash',label:'휴지통'}];let kanbanUsers=[];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
-async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');kanbanUsers=data.users;$('newTodoAssignee').innerHTML=kanbanUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');if(kanbanUsers.length&&!kanbanUsers.some(u=>u.id===userId))$('newTodoAssignee').value=kanbanUsers[0].id;else $('newTodoAssignee').value=userId;render(data)}catch(e){toast(e.message)}}
+async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');kanbanUsers=data.users;render(data)}catch(e){toast(e.message)}}
 $('newTodoTitle').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('addKanbanTodo').click()}});
-$('addKanbanTodo').onclick=async()=>{try{const title=$('newTodoTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/kanban/todos',{method:'POST',body:JSON.stringify({title,note:$('newTodoNote').value,due_date:$('newTodoDue').value||null,assignee_id:$('newTodoAssignee').value,visibility:'shared'})});$('newTodoTitle').value='';$('newTodoNote').value='';$('newTodoDue').value='';await load();toast('TODO를 추가했습니다.')}catch(e){toast(e.message)}};
-function render(data){const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
+$('addKanbanTodo').onclick=async()=>{try{const title=$('newTodoTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/kanban/todos',{method:'POST',body:JSON.stringify({title,visibility:'shared'})});$('newTodoTitle').value='';await load();toast('TODO를 추가했습니다.')}catch(e){toast(e.message)}};
+let kanbanTodos=[];
+function openKanbanTodoEdit(id){const t=kanbanTodos.find(x=>x.id===id);if(!t)return;$('kanbanEditTitle').value=t.title;$('kanbanEditAssignee').innerHTML=kanbanUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');$('kanbanEditAssignee').value=t.assignee_id;$('kanbanEditDue').value=t.due_date||'';$('kanbanEditNote').value=t.note||'';$('saveKanbanTodoEdit').dataset.todoId=String(id);$('kanbanTodoEditModal').classList.add('open')}
+$('saveKanbanTodoEdit').onclick=async()=>{try{const id=Number($('saveKanbanTodoEdit').dataset.todoId),title=$('kanbanEditTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('kanbanEditDue').value||null,note:$('kanbanEditNote').value,assignee_id:$('kanbanEditAssignee').value,visibility:'shared'})});$('kanbanTodoEditModal').classList.remove('open');await load();toast('TODO를 수정했습니다.')}catch(e){toast(e.message)}};
+function render(data){kanbanTodos=data.todos;const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
  for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
- for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
+ for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div><button type="button" class="edit-kanban-todo" data-edit-todo="'+t.id+'">수정</button></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
  html+='</div>'}board.innerHTML=html;
+board.querySelectorAll('[data-edit-todo]').forEach(button=>button.addEventListener('click',e=>{e.stopPropagation();openKanbanTodoEdit(Number(button.dataset.editTodo))}));
 board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
 board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;if(zone.dataset.status==='trash'&&!confirm('이 TODO를 휴지통으로 이동할까요?\n메인 TODO 목록에서 숨겨지며 관리자 페이지에서 복구할 수 있습니다.'))return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast(zone.dataset.status==='trash'?'TODO를 휴지통으로 이동했습니다.':'업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
 }
