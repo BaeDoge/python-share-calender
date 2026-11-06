@@ -563,6 +563,21 @@ def admin_delete_user(user_id: str, request: Request,
     return {"ok": True, "deleted_at": deleted_at}
 
 
+@app.post("/api/admin/users/{user_id}/restore")
+def admin_restore_user(user_id: str, request: Request,
+                       x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    with db() as conn:
+        row = conn.execute("SELECT id,deleted_at FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "사용자를 찾을 수 없습니다.")
+        if not row["deleted_at"]:
+            raise HTTPException(409, "이미 활성 상태인 사용자입니다.")
+        conn.execute("UPDATE users SET deleted_at=NULL WHERE id=?", (user_id,))
+    audit(request, None, "ADMIN_USER_RESTORE", target_user_id=user_id)
+    return {"ok": True}
+
+
 @app.post("/api/users/identify")
 def identify_user(payload: IdentifyIn, request: Request):
     ip = client_ip(request)
@@ -1205,7 +1220,7 @@ function getBrowserId(){let id=localStorage.getItem('company-calendar-user');if(
 async function identify(){
  let id=getBrowserId(),savedName=localStorage.getItem('company-calendar-name')||null;
  let result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});
- if(result.deleted){localStorage.removeItem('company-calendar-user');localStorage.removeItem('company-calendar-name');throw Error('해당 계정은 비활성화되었습니다. 관리자에게 문의하세요.');}
+ if(result.deleted){throw Error('해당 계정은 비활성화되었습니다. 관리자에게 문의하세요.');}
  if(result.needs_name){
   let name='';
   while(!name){
@@ -1407,9 +1422,10 @@ async function loadRecords(){try{const table=$('table').value;const data=await a
 function renderRows(columns){
  const q=$('filter').value.trim().toLowerCase();
  const rows=currentRows.filter(row=>!q||columns.some(c=>String(row[c]??'').toLowerCase().includes(q)));
- $('tbody').innerHTML=rows.map(row=>'<tr>'+columns.map(c=>'<td><pre>'+esc(typeof row[c]==='object'?JSON.stringify(row[c]):row[c])+'</pre></td>').join('')+'<td>'+((row.deleted_at&&['events','todos'].includes($('table').value))?'<button class="primary" data-restore="'+row.id+'">복구</button>':($('table').value==='users'&&!row.deleted_at?'<button class="danger" data-delete-user="'+esc(row.id)+'">계정 삭제</button>':'—'))+'</td></tr>').join('')||'<tr><td colspan="'+(columns.length+1)+'" class="muted">표시할 데이터가 없습니다.</td></tr>';
+ $('tbody').innerHTML=rows.map(row=>'<tr>'+columns.map(c=>'<td><pre>'+esc(typeof row[c]==='object'?JSON.stringify(row[c]):row[c])+'</pre></td>').join('')+'<td>'+((row.deleted_at&&['events','todos'].includes($('table').value))?'<button class="primary" data-restore="'+row.id+'">복구</button>':($('table').value==='users'?(row.deleted_at?'<button class="primary" data-restore-user="'+esc(row.id)+'">계정 복구</button>':'<button class="danger" data-delete-user="'+esc(row.id)+'">계정 삭제</button>'):'—'))+'</td></tr>').join('')||'<tr><td colspan="'+(columns.length+1)+'" class="muted">표시할 데이터가 없습니다.</td></tr>';
  $('tbody').querySelectorAll('[data-restore]').forEach(b=>b.onclick=async()=>{if(!confirm('이 항목을 복구할까요?'))return;try{await api('/api/admin/restore/'+$('table').value+'/'+b.dataset.restore,{method:'POST'});await loadSummary();await loadRecords()}catch(e){showError(e)}});
  $('tbody').querySelectorAll('[data-delete-user]').forEach(b=>b.onclick=async()=>{if(!confirm('이 계정을 비활성화할까요? 일정, TODO, 댓글, 첨부파일 이력은 보존됩니다.'))return;try{await api('/api/admin/users/'+encodeURIComponent(b.dataset.deleteUser),{method:'DELETE'});await loadSummary();await loadRecords()}catch(e){showError(e)}});
+ $('tbody').querySelectorAll('[data-restore-user]').forEach(b=>b.onclick=async()=>{if(!confirm('이 계정을 다시 활성화할까요?'))return;try{await api('/api/admin/users/'+encodeURIComponent(b.dataset.restoreUser)+'/restore',{method:'POST'});await loadSummary();await loadRecords()}catch(e){showError(e)}});
 }
 $('login').onclick=unlock;$('token').addEventListener('keydown',e=>{if(e.key==='Enter')unlock()});$('table').onchange=()=>{offset=0;loadRecords()};$('refresh').onclick=async()=>{await loadSummary();await loadRecords()};$('filter').oninput=()=>{const cols=currentRows.length?Object.keys(currentRows[0]):[];renderRows(cols)};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);loadRecords()};$('next').onclick=()=>{offset+=limit;loadRecords()};$('logout').onclick=()=>{sessionStorage.removeItem('calendar-admin-token');token='';$('app').classList.add('hidden');$('auth').classList.remove('hidden');$('token').value=''};
 if(token){$('token').value=token;unlock()}
