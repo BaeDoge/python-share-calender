@@ -44,7 +44,7 @@ if not logger.handlers:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
-app = FastAPI(title="사내 공용 캘린더", version="0.6.0")
+app = FastAPI(title="사내 공용 캘린더", version="0.6.1")
 
 
 def db() -> sqlite3.Connection:
