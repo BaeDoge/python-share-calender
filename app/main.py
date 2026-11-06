@@ -65,7 +65,8 @@ def init_db() -> None:
             ip TEXT NOT NULL,
             color TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL
+            last_seen TEXT NOT NULL,
+            deleted_at TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +92,7 @@ def init_db() -> None:
             title TEXT NOT NULL,
             due_date TEXT,
             priority TEXT NOT NULL DEFAULT 'normal',
+            note TEXT NOT NULL DEFAULT '',
             completed INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'todo',
             assignee_id TEXT,
@@ -147,7 +149,12 @@ def init_db() -> None:
         ]:
             if name not in event_columns:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {name} {sql_type} DEFAULT {default}")
+        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "deleted_at" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
         todo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
+        if "note" not in todo_columns:
+            conn.execute("ALTER TABLE todos ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         if "status" not in todo_columns:
             conn.execute("ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'todo'")
         if "assignee_id" not in todo_columns:
@@ -195,7 +202,16 @@ class EventIn(BaseModel):
 class TodoIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     due_date: str | None = None
-    priority: str = "normal"
+    note: str = Field(default="", max_length=2000)
+    assignee_id: str | None = Field(default=None, min_length=8, max_length=80)
+    visibility: str = "personal"
+
+
+class TodoUpdateIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    due_date: str | None = None
+    note: str = Field(default="", max_length=2000)
+    assignee_id: str = Field(min_length=8, max_length=80)
     visibility: str = "personal"
 
 
@@ -241,9 +257,9 @@ def get_user(request: Request, user_id: str | None) -> sqlite3.Row:
     if not user_id:
         raise HTTPException(401, "사용자 식별 정보가 없습니다. 페이지를 새로고침해 주세요.")
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE id=? AND deleted_at IS NULL", (user_id,)).fetchone()
         if not row:
-            raise HTTPException(401, "등록되지 않은 사용자입니다. 페이지를 새로고침해 주세요.")
+            raise HTTPException(401, "등록되지 않았거나 삭제된 사용자입니다. 페이지를 새로고침해 주세요.")
         conn.execute(
             "UPDATE users SET ip=?, last_seen=? WHERE id=?",
             (client_ip(request), datetime.now().isoformat(timespec="seconds"), user_id),
@@ -531,6 +547,22 @@ def admin_restore(table: str, record_id: int, request: Request,
     return {"ok": True}
 
 
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: str, request: Request,
+                      x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    with db() as conn:
+        row = conn.execute("SELECT id,display_name,deleted_at FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "사용자를 찾을 수 없습니다.")
+        if row["deleted_at"]:
+            raise HTTPException(409, "이미 삭제된 사용자입니다.")
+        deleted_at = datetime.now().isoformat(timespec="seconds")
+        conn.execute("UPDATE users SET deleted_at=? WHERE id=?", (deleted_at, user_id))
+    audit(request, None, "ADMIN_USER_DELETE", target_user_id=user_id, display_name=row["display_name"])
+    return {"ok": True, "deleted_at": deleted_at}
+
+
 @app.post("/api/users/identify")
 def identify_user(payload: IdentifyIn, request: Request):
     ip = client_ip(request)
@@ -539,21 +571,17 @@ def identify_user(payload: IdentifyIn, request: Request):
 
     with db() as conn:
         existing = conn.execute("SELECT * FROM users WHERE id=?", (payload.user_id,)).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE users SET ip=?,last_seen=? WHERE id=?",
-                (ip, now, payload.user_id),
-            )
-            result = {
-                "id": existing["id"],
-                "display_name": existing["display_name"],
-                "color": existing["color"],
-                "needs_name": False,
-            }
+        if existing and existing["deleted_at"]:
+            result = {"id": existing["id"], "display_name": "", "color": existing["color"],
+                      "needs_name": True, "deleted": True}
+        elif existing:
+            conn.execute("UPDATE users SET ip=?,last_seen=? WHERE id=?", (ip, now, payload.user_id))
+            result = {"id": existing["id"], "display_name": existing["display_name"],
+                      "color": existing["color"], "needs_name": not bool(existing["display_name"].strip())}
         else:
             # 브라우저 저장소가 초기화된 경우 같은 IP에 사용자가 한 명뿐이면 기존 사용자를 재사용합니다.
             same_ip = conn.execute(
-                "SELECT * FROM users WHERE ip=? ORDER BY last_seen DESC",
+                "SELECT * FROM users WHERE ip=? AND deleted_at IS NULL ORDER BY last_seen DESC",
                 (ip,),
             ).fetchall()
 
@@ -608,27 +636,32 @@ def identify_user(payload: IdentifyIn, request: Request):
 
 @app.post("/api/users")
 def register_user(payload: UserIn, request: Request):
+    display_name = payload.display_name.strip()
+    if not display_name:
+        raise HTTPException(422, "이름을 입력해야 접속할 수 있습니다.")
     now = datetime.now().isoformat(timespec="seconds")
-    palette = ["#2563eb", "#059669", "#d97706", "#9333ea", "#db2777", "#0891b2", "#475569", "#0f766e"]
+    palette = ["#2563eb", "#059669", "#d97706", "#9333ea", "#db2775", "#0891b2", "#475569", "#0f766e"]
     with db() as conn:
         existing = conn.execute("SELECT * FROM users WHERE id=?", (payload.user_id,)).fetchone()
         if existing:
-            conn.execute("UPDATE users SET display_name=?,ip=?,last_seen=? WHERE id=?",
-                         (payload.display_name, client_ip(request), now, payload.user_id))
+            conn.execute("UPDATE users SET display_name=?,ip=?,last_seen=?,deleted_at=NULL WHERE id=?",
+                         (display_name, client_ip(request), now, payload.user_id))
             color = existing["color"]
         else:
             count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             color = palette[count % len(palette)]
-            conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)",
-                         (payload.user_id, payload.display_name, client_ip(request), color, now, now))
-    audit(request, payload.user_id, "USER_REGISTER", display_name=payload.display_name)
-    return {"id": payload.user_id, "display_name": payload.display_name, "color": color}
+            conn.execute("INSERT INTO users(id,display_name,ip,color,created_at,last_seen,deleted_at) VALUES(?,?,?,?,?,?,NULL)",
+                         (payload.user_id, display_name, client_ip(request), color, now, now))
+    audit(request, payload.user_id, "USER_REGISTER", display_name=display_name)
+    return {"id": payload.user_id, "display_name": display_name, "color": color}
 
 
 @app.patch("/api/users/me")
 def rename_user(payload: RenameIn, request: Request,
                 x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
+    if not payload.display_name.strip():
+        raise HTTPException(422, "이름을 비워둘 수 없습니다.")
     with db() as conn:
         conn.execute("UPDATE users SET display_name=? WHERE id=?", (payload.display_name.strip(), user["id"]))
     audit(request, user["id"], "USER_RENAME", old_name=user["display_name"], new_name=payload.display_name.strip())
@@ -894,13 +927,24 @@ def delete_event_comment(comment_id: int, request: Request,
     return {"ok": True}
 
 
+@app.get("/api/users/options")
+def user_options(request: Request, x_user_id: str | None = Header(default=None)):
+    current = get_user(request, x_user_id)
+    with db() as conn:
+        rows = conn.execute("SELECT id,display_name FROM users WHERE deleted_at IS NULL AND (display_name <> '관리자' OR id=?) ORDER BY display_name COLLATE NOCASE,id", (current["id"],)).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.get("/api/todos")
 def list_todos(request: Request, x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
     with db() as conn:
-        rows = conn.execute("""SELECT t.*,u.display_name,u.color FROM todos t
-            JOIN users u ON u.id=t.owner_id
-            WHERE t.deleted_at IS NULL AND (t.visibility='shared' OR t.owner_id=?)
+        rows = conn.execute("""SELECT t.*,owner.display_name,owner.color,
+                    COALESCE(assignee.display_name,owner.display_name) AS assignee_name
+            FROM todos t JOIN users owner ON owner.id=t.owner_id
+            LEFT JOIN users assignee ON assignee.id=t.assignee_id AND assignee.deleted_at IS NULL
+            WHERE t.deleted_at IS NULL AND owner.deleted_at IS NULL
+              AND (t.visibility='shared' OR t.owner_id=?)
             ORDER BY t.completed,t.due_date,t.id DESC""", (user["id"],)).fetchall()
     audit(request, user["id"], "TODO_VIEW", result_count=len(rows))
     return [dict(row) for row in rows]
@@ -910,21 +954,62 @@ def list_todos(request: Request, x_user_id: str | None = Header(default=None)):
 def create_todo(payload: TodoIn, request: Request,
                 x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
-    if payload.priority not in ("low", "normal", "high"):
-        raise HTTPException(422, "우선순위 값이 올바르지 않습니다.")
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(422, "TODO 제목을 입력해야 합니다.")
     if payload.visibility not in ("personal", "shared"):
         raise HTTPException(422, "공개 범위가 올바르지 않습니다.")
     if payload.due_date:
-        date.fromisoformat(payload.due_date)
+        try:
+            date.fromisoformat(payload.due_date)
+        except ValueError as exc:
+            raise HTTPException(422, "마감일 형식이 올바르지 않습니다.") from exc
+    assignee_id = payload.assignee_id or user["id"]
     with db() as conn:
-        cur = conn.execute("""INSERT INTO todos(title,due_date,priority,visibility,owner_id,created_at)
-            VALUES(?,?,?,?,?,?)""",
-            (payload.title.strip(), payload.due_date, payload.priority, payload.visibility,
+        assignee = conn.execute("SELECT id FROM users WHERE id=? AND deleted_at IS NULL", (assignee_id,)).fetchone()
+        if not assignee:
+            raise HTTPException(404, "담당자를 찾을 수 없습니다.")
+        if payload.visibility == "personal" and assignee_id != user["id"]:
+            raise HTTPException(422, "개인 TODO의 담당자는 본인만 지정할 수 있습니다.")
+        cur = conn.execute("""INSERT INTO todos(title,due_date,note,assignee_id,visibility,owner_id,created_at)
+            VALUES(?,?,?,?,?,?,?)""",
+            (title, payload.due_date, payload.note.strip(), assignee_id, payload.visibility,
              user["id"], datetime.now().isoformat(timespec="seconds")))
         todo_id = cur.lastrowid
-    audit(request, user["id"], "TODO_CREATE", todo_id=todo_id, title=payload.title,
-          visibility=payload.visibility, due_date=payload.due_date)
+    audit(request, user["id"], "TODO_CREATE", todo_id=todo_id, title=title,
+          visibility=payload.visibility, due_date=payload.due_date, assignee_id=assignee_id)
     return {"id": todo_id}
+
+
+@app.put("/api/todos/{todo_id}")
+def update_todo(todo_id: int, payload: TodoUpdateIn, request: Request,
+                x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(422, "TODO 제목을 입력해야 합니다.")
+    if payload.visibility not in ("personal", "shared"):
+        raise HTTPException(422, "공개 범위가 올바르지 않습니다.")
+    if payload.due_date:
+        try:
+            date.fromisoformat(payload.due_date)
+        except ValueError as exc:
+            raise HTTPException(422, "마감일 형식이 올바르지 않습니다.") from exc
+    with db() as conn:
+        row = conn.execute("SELECT owner_id,deleted_at FROM todos WHERE id=?", (todo_id,)).fetchone()
+        if not row or row["deleted_at"]:
+            raise HTTPException(404, "TODO를 찾을 수 없습니다.")
+        if row["owner_id"] != user["id"]:
+            raise HTTPException(403, "본인이 등록한 TODO만 수정할 수 있습니다.")
+        assignee = conn.execute("SELECT id FROM users WHERE id=? AND deleted_at IS NULL", (payload.assignee_id,)).fetchone()
+        if not assignee:
+            raise HTTPException(404, "담당자를 찾을 수 없습니다.")
+        if payload.visibility == "personal" and payload.assignee_id != user["id"]:
+            raise HTTPException(422, "개인 TODO의 담당자는 본인만 지정할 수 있습니다.")
+        conn.execute("UPDATE todos SET title=?,due_date=?,note=?,assignee_id=?,visibility=? WHERE id=?",
+                     (title, payload.due_date, payload.note.strip(), payload.assignee_id, payload.visibility, todo_id))
+    audit(request, user["id"], "TODO_UPDATE", todo_id=todo_id, title=title)
+    return {"ok": True}
 
 
 @app.patch("/api/todos/{todo_id}")
@@ -949,15 +1034,40 @@ def toggle_todo(todo_id: int, request: Request,
 def get_kanban_data(request: Request, x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
     with db() as conn:
-        users = conn.execute("SELECT id,display_name FROM users ORDER BY display_name COLLATE NOCASE,id").fetchall()
-        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.priority,t.completed,t.status,
+        users = conn.execute("SELECT id,display_name FROM users WHERE deleted_at IS NULL AND display_name <> '관리자' ORDER BY display_name COLLATE NOCASE,id").fetchall()
+        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.note,t.completed,t.status,
                                        t.owner_id,COALESCE(t.assignee_id,t.owner_id) AS assignee_id,
-                                       t.created_at,u.display_name
+                                       t.created_at,u.display_name AS assignee_name
                                 FROM todos t JOIN users u ON u.id=COALESCE(t.assignee_id,t.owner_id)
                                 WHERE t.deleted_at IS NULL AND t.visibility='shared'
+                                  AND u.deleted_at IS NULL AND u.display_name <> '관리자'
                                 ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.id""").fetchall()
     audit(request, user["id"], "KANBAN_VIEW", result_count=len(todos))
     return {"users":[dict(row) for row in users],"todos":[dict(row) for row in todos]}
+
+
+@app.post("/api/kanban/todos")
+def create_kanban_todo(payload: TodoIn, request: Request,
+                       x_user_id: str | None = Header(default=None)):
+    user = get_user(request, x_user_id)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(422, "TODO 제목을 입력해야 합니다.")
+    if payload.due_date:
+        try:
+            date.fromisoformat(payload.due_date)
+        except ValueError as exc:
+            raise HTTPException(422, "마감일 형식이 올바르지 않습니다.") from exc
+    assignee_id = payload.assignee_id or user["id"]
+    with db() as conn:
+        assignee = conn.execute("SELECT id FROM users WHERE id=? AND deleted_at IS NULL AND display_name <> '관리자'", (assignee_id,)).fetchone()
+        if not assignee:
+            raise HTTPException(404, "담당자를 찾을 수 없습니다.")
+        cur = conn.execute("INSERT INTO todos(title,due_date,note,assignee_id,visibility,owner_id,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                           (title, payload.due_date, payload.note.strip(), assignee_id, "shared", user["id"], "todo", datetime.now().isoformat(timespec="seconds")))
+        todo_id = cur.lastrowid
+    audit(request, user["id"], "KANBAN_TODO_CREATE", todo_id=todo_id, title=title, assignee_id=assignee_id)
+    return {"id": todo_id}
 
 
 @app.patch("/api/kanban/todos/{todo_id}")
