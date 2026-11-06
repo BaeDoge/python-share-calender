@@ -145,6 +145,8 @@ def prune(cutoff: str) -> dict[str, int]:
     checkpoint = connect(DB_PATH)
     try:
         checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint.execute("VACUUM")
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         checkpoint.close()
     return counts
@@ -185,6 +187,7 @@ def main() -> int:
     for table, count in removed.items():
         print(f"  {table}: {count:,}건 삭제")
     print("백업 ZIP은 별도로 보관되며, calendar.db와 uploads 폴더를 포함합니다.")
+    print("VACUUM을 수행해 현 DB 파일의 미사용 공간도 회수했습니다.")
     return 0
 
 
