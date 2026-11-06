@@ -1142,7 +1142,7 @@ HTML = r'''<!doctype html>
  </main>
  <aside class="panel side-panel">
   <section class="side-section"><div class="side-label">QUICK ADD</div><h3 class="section-title" style="margin-top:5px">자연어로 일정 등록</h3><div class="field"><input id="naturalInput" placeholder="예: 다음 주 수요일 2시부터 3시 회의"></div><button class="primary full" id="parseBtn">일정 분석하기</button><div class="parse-result" id="parseResult"></div><p class="natural-help">오전/오후를 생략한 1~11시는 오후로 해석합니다. 분석 결과 확인 후 저장하세요.</p></section>
-  <section class="side-section"><div class="side-label">MY TASKS</div><div class="section-title" style="margin-top:5px"><span>Todo</span><select id="todoFilter" class="todo-filter" style="width:auto"><option value="all">전체</option><option value="open">진행 중</option><option value="done">완료</option></select></div><div class="field"><input id="todoTitle" placeholder="새로운 할 일을 입력하세요"></div><div class="inline"><input id="todoDue" type="date" aria-label="마감일"><select id="todoScope" aria-label="공개 범위"><option value="personal">개인</option><option value="shared">공용</option></select></div><div class="field"><select id="todoPriority"><option value="normal">보통 우선순위</option><option value="high">높은 우선순위</option><option value="low">낮은 우선순위</option></select></div><button id="todoAdd" class="full">Todo 추가</button><div id="todoList" class="todo-list"></div><p class="natural-help">완료한 Todo는 자동 삭제되지 않습니다. 필요할 때 휴지통으로 직접 삭제할 수 있습니다.</p></section>
+  <section class="side-section"><div class="side-label">MY TASKS</div><div class="section-title" style="margin-top:5px"><span>Todo</span><select id="todoFilter" class="todo-filter" style="width:auto"><option value="all">전체</option><option value="open">진행 중</option><option value="done">완료</option></select></div><div class="field"><input id="todoTitle" placeholder="새로운 할 일을 입력하세요"></div><div class="inline"><input id="todoDue" type="date" aria-label="마감일"><select id="todoScope" aria-label="공개 범위"><option value="personal">개인</option><option value="shared">공용</option></select></div><div class="field"><label>담당자</label><select id="todoAssignee"></select></div><div class="field"><label>비고</label><textarea id="todoNote" rows="2" maxlength="2000" placeholder="참고 사항이나 상세 내용을 입력하세요"></textarea></div><button id="todoAdd" class="full">Todo 추가</button><div id="todoList" class="todo-list"></div><div class="inline" style="align-items:center;justify-content:space-between;margin-top:8px"><button id="todoPrev" type="button">이전</button><span id="todoPageInfo" class="natural-help"></span><button id="todoNext" type="button">다음</button></div><p class="natural-help">완료한 Todo는 자동 삭제되지 않습니다. 필요할 때 휴지통으로 직접 삭제할 수 있습니다.</p></section>
  </aside>
 </div></div>
 
@@ -1171,6 +1171,7 @@ HTML = r'''<!doctype html>
 <div class="modal" id="searchModal"><div class="dialog wide"><div class="dialog-head"><h2>일정 검색</h2><button class="close" data-close="searchModal">×</button></div>
  <div class="search-filters"><input id="searchQuery" placeholder="제목, 설명, 담당자, 작업번호"><select id="searchCategory"><option value="">모든 유형</option><option>SR</option><option>CM</option><option>회의</option><option>휴가</option><option>기타</option></select><select id="searchEnvironment"><option value="">모든 환경</option><option>Dev</option><option>Stg</option><option>Prd</option></select><input id="searchFrom" type="date" aria-label="시작 날짜"><input id="searchTo" type="date" aria-label="종료 날짜"></div>
  <button id="runSearch" class="primary" style="margin-bottom:13px">검색 실행</button><div id="searchResults" class="event-list"></div></div></div>
+<div class="modal" id="todoEditModal"><div class="dialog"><div class="dialog-head"><h2>TODO 수정</h2><button class="close" data-close="todoEditModal">×</button></div><div class="field"><label>할 일 *</label><input id="editTodoTitle" maxlength="200"></div><div class="inline"><div class="field"><label>마감일</label><input id="editTodoDue" type="date"></div><div class="field"><label>공개 범위</label><select id="editTodoScope"><option value="personal">개인</option><option value="shared">공용</option></select></div></div><div class="field"><label>담당자</label><select id="editTodoAssignee"></select></div><div class="field"><label>비고</label><textarea id="editTodoNote" rows="4" maxlength="2000"></textarea></div><div class="dialog-actions"><button data-close="todoEditModal">취소</button><button id="saveTodoEdit" class="primary">변경 저장</button></div></div></div>
 <div class="modal" id="settingsModal"><div class="dialog"><div class="dialog-head"><h2>사용자 설정</h2><button class="close" data-close="settingsModal">×</button></div><div class="field"><label>캘린더 표시 이름</label><input id="displayName" maxlength="30"></div><p class="settings-note">이름은 서버의 사용자 정보에 저장됩니다. 같은 브라우저로 다시 접속하면 이름을 다시 입력할 필요가 없습니다. 브라우저 저장소를 초기화한 경우에도 해당 IP에 등록 사용자가 한 명이면 기존 사용자를 연결합니다.</p><div class="dialog-actions"><button data-close="settingsModal">취소</button><button id="saveSettings" class="primary">이름 저장</button></div></div></div>
 <div class="toast" id="toast"></div>
 
@@ -1201,8 +1202,23 @@ function createBrowserUuid(){
  });
 }
 function getBrowserId(){let id=localStorage.getItem('company-calendar-user');if(!id){id=createBrowserUuid();localStorage.setItem('company-calendar-user',id)}return id}
-async function identify(){let id=getBrowserId();let savedName=localStorage.getItem('company-calendar-name')||null;let result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});
- if(result.needs_name){let name=prompt('캘린더에 표시할 이름을 입력하세요');if(!name||!name.trim())name='익명 사용자';result=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:result.id,display_name:name.trim()})}).then(r=>r.json());localStorage.setItem('company-calendar-user',result.id);localStorage.setItem('company-calendar-name',result.display_name)}else{localStorage.setItem('company-calendar-user',result.id);localStorage.setItem('company-calendar-name',result.display_name)}
+async function identify(){
+ let id=getBrowserId(),savedName=localStorage.getItem('company-calendar-name')||null;
+ let result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});
+ if(result.deleted){id=createBrowserUuid();localStorage.setItem('company-calendar-user',id);result=await fetch('/api/users/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,display_name:savedName})}).then(async r=>{if(!r.ok)throw Error('사용자 식별 실패');return r.json()});}
+ if(result.needs_name){
+  let name='';
+  while(!name){
+   const entered=prompt('캘린더에 표시할 이름을 입력해야 접속할 수 있습니다.');
+   if(entered===null){localStorage.removeItem('company-calendar-user');throw Error('이름을 입력해야 캘린더를 이용할 수 있습니다.');}
+   name=entered.trim();
+   if(!name)alert('이름은 필수 입력입니다. 공백으로 접속할 수 없습니다.');
+  }
+  const response=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:result.id,display_name:name})});
+  if(!response.ok){const data=await response.json().catch(()=>({}));throw Error(data.detail||'사용자 등록 실패');}
+  result=await response.json();
+ }
+ localStorage.setItem('company-calendar-user',result.id);localStorage.setItem('company-calendar-name',result.display_name);
  user=result;$('who').textContent=user.display_name;$('userDot').style.background=user.color;$('displayName').value=user.display_name;
 }
 function eventEndDate(e){return (e.end_at||e.start_at).slice(0,10)}
@@ -1260,16 +1276,56 @@ $('eventAllDay').onchange=()=>{if($('eventAllDay').checked){let s=$('eventStart'
 $('prev').onclick=()=>{if(viewMode==='month')cursor.setMonth(cursor.getMonth()-1);else cursor.setDate(cursor.getDate()-7);refresh()};$('next').onclick=()=>{if(viewMode==='month')cursor.setMonth(cursor.getMonth()+1);else cursor.setDate(cursor.getDate()+7);refresh()};$('today').onclick=()=>{cursor=new Date();refresh()};$('addEvent').onclick=()=>openNew();$('monthView').onclick=()=>{viewMode='month';$('monthView').classList.add('active');$('weekView').classList.remove('active');refresh()};$('weekView').onclick=()=>{viewMode='week';$('weekView').classList.add('active');$('monthView').classList.remove('active');refresh()};
 $('parseBtn').onclick=async()=>{try{if(!$('naturalInput').value.trim())throw Error('일정 내용을 입력하세요.');let parsed=await api('/api/parse',{method:'POST',body:JSON.stringify({text:$('naturalInput').value})});$('parseResult').style.display='block';$('parseResult').textContent=`분석 결과: ${parsed.date}${parsed.all_day&&parsed.end_at&&parsed.end_at.slice(0,10)!==parsed.date?' ~ '+parsed.end_at.slice(0,10):''} ${parsed.time_detected?parsed.start_at.slice(11,16):'종일'} · ${parsed.time_detected&&parsed.end_at?'종료 '+parsed.end_at.slice(11,16):''} · 제목: ${parsed.title}`;openNew(parsed.date,Number(parsed.start_at.slice(11,13)),'eventDesc');$('eventTitle').value=parsed.title;$('eventStart').value=parsed.start_at;$('eventEnd').value=parsed.end_at||'';$('eventAllDay').checked=parsed.all_day;if(parsed.all_day){$('eventStart').value=parsed.date+'T00:00';$('eventEnd').value=parsed.date+'T23:59'} }catch(e){showToast(e.message)}};
 $('naturalInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('parseBtn').click()}});
-$('todoAdd').onclick=async()=>{try{let title=$('todoTitle').value.trim();if(!title)throw Error('Todo 내용을 입력하세요.');await api('/api/todos',{method:'POST',body:JSON.stringify({title,due_date:$('todoDue').value||null,priority:$('todoPriority').value,visibility:$('todoScope').value})});$('todoTitle').value='';showToast('Todo를 추가했습니다.');await loadTodos()}catch(e){showToast(e.message)}};
-$('todoFilter').onchange=renderTodos;
-async function loadTodos(){todos=await api('/api/todos');renderTodos()}
-function renderTodos(){let filter=$('todoFilter').value,list=todos.filter(t=>filter==='all'||(filter==='open'&&!t.completed)||(filter==='done'&&t.completed));$('todoList').innerHTML=list.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · ${t.due_date||'마감일 없음'} · ${esc(t.display_name)}</div></div><button class="todo-delete" data-delete-todo="${t.id}" title="Todo 삭제">♲</button></div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';$('todoList').querySelectorAll('[data-todo]').forEach(c=>c.onchange=async()=>{try{await api(`/api/todos/${c.dataset.todo}`,{method:'PATCH'});await loadTodos()}catch(e){showToast(e.message);c.checked=!c.checked}});$('todoList').querySelectorAll('[data-delete-todo]').forEach(b=>b.onclick=async()=>{if(confirm('Todo를 삭제할까요?')){try{await api(`/api/todos/${b.dataset.deleteTodo}`,{method:'DELETE'});showToast('Todo를 삭제했습니다.');await loadTodos()}catch(e){showToast(e.message)}}})}
+let todoPage=0;const todoPageSize=8;let todoUsers=[];
+async function loadTodoUsers(){
+ todoUsers=await api('/api/users/options');
+ const options=todoUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');
+ $('todoAssignee').innerHTML=options;$('editTodoAssignee').innerHTML=options;
+ if(user&&todoUsers.some(u=>u.id===user.id))$('todoAssignee').value=user.id;
+}
+$('todoAdd').onclick=async()=>{try{
+ const title=$('todoTitle').value.trim();if(!title)throw Error('Todo 내용을 입력하세요.');
+ await api('/api/todos',{method:'POST',body:JSON.stringify({title,due_date:$('todoDue').value||null,note:$('todoNote').value,assignee_id:$('todoAssignee').value||user.id,visibility:$('todoScope').value})});
+ $('todoTitle').value='';$('todoDue').value='';$('todoNote').value='';showToast('Todo를 추가했습니다.');todoPage=0;await loadTodos();
+}catch(e){showToast(e.message)}};
+$('todoTitle').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('todoAdd').click()}});
+$('todoFilter').onchange=()=>{todoPage=0;renderTodos()};
+$('todoPrev').onclick=()=>{todoPage=Math.max(0,todoPage-1);renderTodos()};
+$('todoNext').onclick=()=>{todoPage++;renderTodos()};
+async function loadTodos(){
+ todos=await api('/api/todos');
+ const list=todos.filter(t=>$('todoFilter').value==='all'||($('todoFilter').value==='open'&&!t.completed)||($('todoFilter').value==='done'&&t.completed));
+ todoPage=Math.min(todoPage,Math.max(0,Math.ceil(list.length/todoPageSize)-1));renderTodos();
+}
+function openTodoEdit(id){
+ const t=todos.find(x=>x.id===id);if(!t)return;
+ $('editTodoTitle').value=t.title;$('editTodoDue').value=t.due_date||'';$('editTodoNote').value=t.note||'';
+ $('editTodoScope').value=t.visibility;$('editTodoAssignee').value=t.assignee_id||t.owner_id;
+ $('saveTodoEdit').dataset.todoId=String(id);openModal('todoEditModal');
+}
+$('saveTodoEdit').onclick=async()=>{try{
+ const id=Number($('saveTodoEdit').dataset.todoId),title=$('editTodoTitle').value.trim();if(!title)throw Error('TODO 내용을 입력하세요.');
+ await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('editTodoDue').value||null,note:$('editTodoNote').value,assignee_id:$('editTodoAssignee').value||user.id,visibility:$('editTodoScope').value})});
+ closeModal('todoEditModal');showToast('TODO를 수정했습니다.');await loadTodos();
+}catch(e){showToast(e.message)}};
+function renderTodos(){
+ const filter=$('todoFilter').value,list=todos.filter(t=>filter==='all'||(filter==='open'&&!t.completed)||(filter==='done'&&t.completed));
+ const pages=Math.max(1,Math.ceil(list.length/todoPageSize));todoPage=Math.min(todoPage,pages-1);
+ const pageItems=list.slice(todoPage*todoPageSize,(todoPage+1)*todoPageSize);
+ $('todoList').innerHTML=pageItems.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · 담당: ${esc(t.assignee_name||t.display_name)} · ${t.due_date||'마감일 없음'}</div>${t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':''}</div><button class="todo-delete" data-edit-todo="${t.id}" title="TODO 수정">수정</button><button class="todo-delete" data-delete-todo="${t.id}" title="TODO 삭제">♲</button></div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';
+ $('todoPageInfo').textContent=(list.length?todoPage*todoPageSize+1:0)+'–'+Math.min((todoPage+1)*todoPageSize,list.length)+' / '+list.length+'건';
+ $('todoPrev').disabled=todoPage===0;$('todoNext').disabled=todoPage>=pages-1;
+ $('todoList').querySelectorAll('[data-todo]').forEach(c=>c.onchange=async()=>{try{await api(`/api/todos/${c.dataset.todo}`,{method:'PATCH'});await loadTodos()}catch(e){showToast(e.message);c.checked=!c.checked}});
+ $('todoList').querySelectorAll('[data-edit-todo]').forEach(b=>b.onclick=()=>openTodoEdit(Number(b.dataset.editTodo)));
+ $('todoList').querySelectorAll('[data-delete-todo]').forEach(b=>b.onclick=async()=>{if(confirm('Todo를 삭제할까요?')){try{await api(`/api/todos/${b.dataset.deleteTodo}`,{method:'DELETE'});showToast('Todo를 삭제했습니다.');await loadTodos()}catch(e){showToast(e.message)}}});
+}
 async function runSearch(){let params=new URLSearchParams({q:$('searchQuery').value,category:$('searchCategory').value,environment:$('searchEnvironment').value,from_date:$('searchFrom').value,to_date:$('searchTo').value});let results=await api(`/api/events/search?${params}`);$('searchResults').innerHTML=results.map(e=>`<div class="event-row"><div class="event-color" style="background:${e.color}"></div><div class="event-row-main"><div>${categoryTag(e)}</div><div class="event-row-title">${esc(e.title)}</div><div class="event-row-meta">${e.start_at.replace('T',' ')}${e.end_at?' ~ '+e.end_at.replace('T',' '):''} · ${esc(e.display_name)}${e.assignee?' · '+esc(e.assignee):''}${e.ticket_no?' · '+esc(e.ticket_no):''}</div></div><button data-search-edit="${e.id}">열기</button></div>`).join('')||'<p class="muted" style="font-size:12px">검색 결과가 없습니다.</p>';$('searchResults').querySelectorAll('[data-search-edit]').forEach(b=>b.onclick=()=>{let e=results.find(x=>x.id==b.dataset.searchEdit);closeModal('searchModal');openEvent(e)})}
 $('searchBtn').onclick=()=>{$('searchQuery').value=$('searchInput').value;openModal('searchModal');runSearch()};$('searchInput').onkeydown=e=>{if(e.key==='Enter')$('searchBtn').click()};$('runSearch').onclick=()=>runSearch();$('searchQuery').onkeydown=e=>{if(e.key==='Enter')runSearch()};
 $('settingsBtn').onclick=()=>{$('displayName').value=user.display_name;openModal('settingsModal')};$('saveSettings').onclick=async()=>{try{let name=$('displayName').value.trim();if(!name)throw Error('이름을 입력하세요.');user=await api('/api/users/me',{method:'PATCH',body:JSON.stringify({display_name:name})});localStorage.setItem('company-calendar-name',name);$('who').textContent=name;closeModal('settingsModal');showToast('사용자 이름을 변경했습니다.')}catch(e){showToast(e.message)}};
 async function start(){
  try{
   await identify();
+  await loadTodoUsers();
   await refresh();
  }catch(e){
   // DB 초기화/이전 등으로 브라우저에 저장된 UUID가 서버에 없으면 한 번 새 ID로 재등록합니다.
@@ -1301,20 +1357,23 @@ KANBAN_HTML = r'''<!doctype html>
 @media(max-width:700px){.shell{padding:15px}.top{align-items:flex-start;flex-direction:column}.board-head,.board-row{grid-template-columns:125px repeat(3,minmax(190px,1fr))}}
 </style></head><body><div class="shell">
 <header class="top"><div><h1>팀 TODO 칸반 보드</h1><p>담당자별 업무 진행 현황</p></div><div class="top-actions"><a href="/">← 캘린더로 돌아가기</a><button id="reload">새로고침</button></div></header>
-<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계가 변경되고, 다른 구성원의 행으로 옮기면 담당자도 변경됩니다. 완료됨은 메인 TODO에 완료로 반영됩니다. 휴지통으로 이동한 항목은 목록에서 숨겨지고 관리자 페이지에서 복구할 수 있습니다.</p>
+<p class="board-note">공용 TODO만 표시됩니다. 카드를 다른 칸으로 옮기면 진행 단계와 담당자를 변경할 수 있습니다. 완료됨은 메인 TODO에 완료로 반영됩니다. 휴지통으로 이동한 항목은 관리자 페이지에서 복구할 수 있습니다.</p>
+<section class="board-add" style="display:grid;grid-template-columns:2fr 1.2fr 1fr 1.2fr auto;gap:8px;margin-bottom:14px"><input id="newTodoTitle" maxlength="200" placeholder="새 TODO 제목"><input id="newTodoNote" maxlength="2000" placeholder="비고"><input id="newTodoDue" type="date" aria-label="마감일"><select id="newTodoAssignee" aria-label="담당자"></select><button id="addKanbanTodo" class="primary">TODO 추가</button></section>
 <div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
 </div><div class="toast" id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;
-const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'blocked',label:'보류됨'},{id:'done',label:'완료됨'},{id:'trash',label:'휴지통'}];
+const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'blocked',label:'보류됨'},{id:'done',label:'완료됨'},{id:'trash',label:'휴지통'}];let kanbanUsers=[];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
 async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'X-User-Id':userId,'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.detail||'요청을 처리하지 못했습니다.')}return r.json()}
-async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');render(data)}catch(e){toast(e.message)}}
+async function load(){if(!userId){toast('사용자 정보가 없습니다. 캘린더에서 다시 접속해 주세요.');return}try{const data=await api('/api/kanban');kanbanUsers=data.users;$('newTodoAssignee').innerHTML=kanbanUsers.map(u=>'<option value="'+esc(u.id)+'">'+esc(u.display_name)+'</option>').join('');if(kanbanUsers.length&&!kanbanUsers.some(u=>u.id===userId))$('newTodoAssignee').value=kanbanUsers[0].id;else $('newTodoAssignee').value=userId;render(data)}catch(e){toast(e.message)}}
+$('newTodoTitle').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('addKanbanTodo').click()}});
+$('addKanbanTodo').onclick=async()=>{try{const title=$('newTodoTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/kanban/todos',{method:'POST',body:JSON.stringify({title,note:$('newTodoNote').value,due_date:$('newTodoDue').value||null,assignee_id:$('newTodoAssignee').value,visibility:'shared'})});$('newTodoTitle').value='';$('newTodoNote').value='';$('newTodoDue').value='';await load();toast('TODO를 추가했습니다.')}catch(e){toast(e.message)}};
 function render(data){const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
-for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
-for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task '+(t.priority==='high'?'high':'')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div><div class="task-meta"><span>'+({high:'높음',normal:'보통',low:'낮음'}[t.priority]||'보통')+'</span><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
-html+='</div>'}board.innerHTML=html;
+ for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
+ for(const status of statuses){const items=memberTodos.filter(t=>t.status===status.id);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div></article>').join(''):'<div class="empty">업무 없음</div>')+'</div>'}
+ html+='</div>'}board.innerHTML=html;
 board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
 board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;if(zone.dataset.status==='trash'&&!confirm('이 TODO를 휴지통으로 이동할까요?\n메인 TODO 목록에서 숨겨지며 관리자 페이지에서 복구할 수 있습니다.'))return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast(zone.dataset.status==='trash'?'TODO를 휴지통으로 이동했습니다.':'업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
 }
@@ -1345,7 +1404,13 @@ function showError(e){$('authError').textContent=e.message}
 async function unlock(){token=$('token').value.trim();try{await loadSummary();sessionStorage.setItem('calendar-admin-token',token);$('auth').classList.add('hidden');$('app').classList.remove('hidden');await loadRecords()}catch(e){token='';showError(e)}}
 async function loadSummary(){const data=await api('/api/admin/summary');$('stats').innerHTML=Object.entries(data).map(([k,v])=>'<div class="stat"><strong>'+v+'</strong><span>'+labels[k]+'</span></div>').join('')}
 async function loadRecords(){try{const table=$('table').value;const data=await api('/api/admin/records?table='+encodeURIComponent(table)+'&limit='+limit+'&offset='+offset);currentRows=data.records;$('thead').innerHTML='<tr>'+data.columns.map(c=>'<th>'+esc(c)+'</th>').join('')+'<th>관리</th></tr>';renderRows(data.columns);$('count').textContent=data.total+'건';$('page').textContent=(offset+1)+'–'+Math.min(offset+limit,data.total)+' / '+data.total;$('prev').disabled=offset===0;$('next').disabled=offset+limit>=data.total}catch(e){if(e.message.includes('인증')){sessionStorage.removeItem('calendar-admin-token');$('app').classList.add('hidden');$('auth').classList.remove('hidden')}showError(e)}}
-function renderRows(columns){const q=$('filter').value.trim().toLowerCase();const rows=currentRows.filter(row=>!q||columns.some(c=>String(row[c]??'').toLowerCase().includes(q)));$('tbody').innerHTML=rows.map(row=>'<tr>'+columns.map(c=>'<td><pre>'+esc(typeof row[c]==='object'?JSON.stringify(row[c]):row[c])+'</pre></td>').join('')+'<td>'+((row.deleted_at&&['events','todos'].includes($('table').value))?'<button class="primary" data-restore="'+row.id+'">복구</button>':'—')+'</td></tr>').join('')||'<tr><td colspan="'+(columns.length+1)+'" class="muted">표시할 데이터가 없습니다.</td></tr>';$('tbody').querySelectorAll('[data-restore]').forEach(b=>b.onclick=async()=>{if(!confirm('이 항목을 복구할까요?'))return;try{await api('/api/admin/restore/'+$('table').value+'/'+b.dataset.restore,{method:'POST'});await loadSummary();await loadRecords()}catch(e){showError(e)}})}
+function renderRows(columns){
+ const q=$('filter').value.trim().toLowerCase();
+ const rows=currentRows.filter(row=>!q||columns.some(c=>String(row[c]??'').toLowerCase().includes(q)));
+ $('tbody').innerHTML=rows.map(row=>'<tr>'+columns.map(c=>'<td><pre>'+esc(typeof row[c]==='object'?JSON.stringify(row[c]):row[c])+'</pre></td>').join('')+'<td>'+((row.deleted_at&&['events','todos'].includes($('table').value))?'<button class="primary" data-restore="'+row.id+'">복구</button>':($('table').value==='users'&&!row.deleted_at?'<button class="danger" data-delete-user="'+esc(row.id)+'">계정 삭제</button>':'—'))+'</td></tr>').join('')||'<tr><td colspan="'+(columns.length+1)+'" class="muted">표시할 데이터가 없습니다.</td></tr>';
+ $('tbody').querySelectorAll('[data-restore]').forEach(b=>b.onclick=async()=>{if(!confirm('이 항목을 복구할까요?'))return;try{await api('/api/admin/restore/'+$('table').value+'/'+b.dataset.restore,{method:'POST'});await loadSummary();await loadRecords()}catch(e){showError(e)}});
+ $('tbody').querySelectorAll('[data-delete-user]').forEach(b=>b.onclick=async()=>{if(!confirm('이 계정을 비활성화할까요? 일정, TODO, 댓글, 첨부파일 이력은 보존됩니다.'))return;try{await api('/api/admin/users/'+encodeURIComponent(b.dataset.deleteUser),{method:'DELETE'});await loadSummary();await loadRecords()}catch(e){showError(e)}});
+}
 $('login').onclick=unlock;$('token').addEventListener('keydown',e=>{if(e.key==='Enter')unlock()});$('table').onchange=()=>{offset=0;loadRecords()};$('refresh').onclick=async()=>{await loadSummary();await loadRecords()};$('filter').oninput=()=>{const cols=currentRows.length?Object.keys(currentRows[0]):[];renderRows(cols)};$('prev').onclick=()=>{offset=Math.max(0,offset-limit);loadRecords()};$('next').onclick=()=>{offset+=limit;loadRecords()};$('logout').onclick=()=>{sessionStorage.removeItem('calendar-admin-token');token='';$('app').classList.add('hidden');$('auth').classList.remove('hidden');$('token').value=''};
 if(token){$('token').value=token;unlock()}
 </script></body></html>'''
