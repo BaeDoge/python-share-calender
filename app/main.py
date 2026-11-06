@@ -595,7 +595,7 @@ def identify_user(payload: IdentifyIn, request: Request):
                     "id": row["id"],
                     "display_name": row["display_name"],
                     "color": row["color"],
-                    "needs_name": False,
+                    "needs_name": not bool(row["display_name"].strip()),
                 }
             elif payload.display_name and payload.display_name.strip():
                 # 저장된 이름이 있지만 UUID가 DB에 없는 경우 반드시 신규 사용자를 DB에 생성합니다.
@@ -1312,7 +1312,7 @@ function renderTodos(){
  const filter=$('todoFilter').value,list=todos.filter(t=>filter==='all'||(filter==='open'&&!t.completed)||(filter==='done'&&t.completed));
  const pages=Math.max(1,Math.ceil(list.length/todoPageSize));todoPage=Math.min(todoPage,pages-1);
  const pageItems=list.slice(todoPage*todoPageSize,(todoPage+1)*todoPageSize);
- $('todoList').innerHTML=pageItems.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · 담당: ${esc(t.assignee_name||t.display_name)} · ${t.due_date||'마감일 없음'}</div>${t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':''}</div><button class="todo-delete" data-edit-todo="${t.id}" title="TODO 수정">수정</button><button class="todo-delete" data-delete-todo="${t.id}" title="TODO 삭제">♲</button></div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';
+ $('todoList').innerHTML=pageItems.map(t=>`<div class="todo-item ${t.completed?'done':''}"><input type="checkbox" data-todo="${t.id}" ${t.completed?'checked':''}><div class="todo-main"><span class="todo-title">${esc(t.title)}</span><div class="todo-meta">${t.visibility==='shared'?'공용':'개인'} · 담당: ${esc(t.assignee_name||t.display_name)} · ${t.due_date||'마감일 없음'}</div>${t.note?'<div class="todo-meta">'+esc(t.note)+'</div>':''}</div>${t.owner_id===user.id?'<button class="todo-delete" data-edit-todo="'+t.id+'" title="TODO 수정">수정</button><button class="todo-delete" data-delete-todo="'+t.id+'" title="TODO 삭제">♲</button>':''}</div>`).join('')||'<p class="muted" style="font-size:11px">표시할 Todo가 없습니다.</p>';
  $('todoPageInfo').textContent=(list.length?todoPage*todoPageSize+1:0)+'–'+Math.min((todoPage+1)*todoPageSize,list.length)+' / '+list.length+'건';
  $('todoPrev').disabled=todoPage===0;$('todoNext').disabled=todoPage>=pages-1;
  $('todoList').querySelectorAll('[data-todo]').forEach(c=>c.onchange=async()=>{try{await api(`/api/todos/${c.dataset.todo}`,{method:'PATCH'});await loadTodos()}catch(e){showToast(e.message);c.checked=!c.checked}});
