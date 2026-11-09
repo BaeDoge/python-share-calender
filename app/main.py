@@ -1092,8 +1092,7 @@ def get_kanban_data(request: Request, x_user_id: str | None = Header(default=Non
 
 
 @app.get("/api/kanban/completed")
-def get_completed_todos(page: int = 1, page_size: int = 20,
-                        request: Request = None,
+def get_completed_todos(request: Request, page: int = 1, page_size: int = 20,
                         x_user_id: str | None = Header(default=None)):
     user = get_user(request, x_user_id)
     page = max(1, page)
