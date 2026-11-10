@@ -1080,13 +1080,15 @@ def get_kanban_data(request: Request, x_user_id: str | None = Header(default=Non
     user = get_user(request, x_user_id)
     with db() as conn:
         users = conn.execute("SELECT id,display_name FROM users WHERE deleted_at IS NULL AND display_name <> '관리자' ORDER BY display_name COLLATE NOCASE,id").fetchall()
-        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.note,t.color,t.completed,t.status,t.completed_at,
+        todos = conn.execute("""SELECT t.id,t.title,t.due_date,t.note,t.color,t.completed,
+                                       CASE WHEN t.deleted_at IS NOT NULL THEN 'trash' ELSE t.status END AS status,
+                                       t.completed_at,t.deleted_at,
                                        t.owner_id,COALESCE(t.assignee_id,t.owner_id) AS assignee_id,
                                        t.created_at,u.display_name AS assignee_name
                                 FROM todos t JOIN users u ON u.id=COALESCE(t.assignee_id,t.owner_id)
-                                WHERE t.deleted_at IS NULL AND t.visibility='shared'
+                                WHERE t.visibility='shared'
                                   AND u.deleted_at IS NULL AND u.display_name <> '관리자'
-                                ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.id""").fetchall()
+                                ORDER BY t.deleted_at IS NULL,t.deleted_at DESC,t.due_date IS NULL,t.due_date,t.created_at DESC,t.id DESC""").fetchall()
     audit(request, user["id"], "KANBAN_VIEW", result_count=len(todos))
     return {"users":[dict(row) for row in users],"todos":[dict(row) for row in todos]}
 
@@ -1116,6 +1118,60 @@ def get_completed_todos(request: Request, page: int = 1, page_size: int = 20,
             LIMIT ? OFFSET ?
         """, (page_size, offset)).fetchall()
     audit(request, user["id"], "KANBAN_COMPLETED_VIEW", result_count=len(rows), page=page)
+    return {"items":[dict(row) for row in rows], "page":page,
+            "page_size":page_size, "total":total,
+            "total_pages":(total + page_size - 1) // page_size}
+
+
+@app.get("/api/kanban/items")
+def get_kanban_column_items(
+    request: Request,
+    status: str,
+    owner_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    x_user_id: str | None = Header(default=None),
+):
+    user = get_user(request, x_user_id)
+    if status not in ("todo", "in_progress", "blocked", "done", "trash"):
+        raise HTTPException(422, "칸반 단계가 올바르지 않습니다.")
+    page = max(1, page)
+    page_size = min(50, max(1, page_size))
+    offset = (page - 1) * page_size
+
+    if status == "trash":
+        status_where = "t.deleted_at IS NOT NULL"
+        order_by = "t.deleted_at DESC,t.created_at DESC,t.id DESC"
+    elif status == "done":
+        status_where = "t.deleted_at IS NULL AND (t.status='done' OR t.completed=1)"
+        order_by = "COALESCE(t.completed_at,t.created_at) DESC,t.id DESC"
+    else:
+        status_where = "t.deleted_at IS NULL AND t.status=?"
+        order_by = "t.created_at DESC,t.id DESC"
+
+    with db() as conn:
+        params = [owner_id]
+        if status not in ("trash", "done"):
+            params.append(status)
+        where = f"t.visibility='shared' AND COALESCE(t.assignee_id,t.owner_id)=? AND {status_where}"
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM todos t WHERE {where}", params
+        ).fetchone()[0]
+        rows = conn.execute(f"""
+            SELECT t.id,t.title,t.note,t.due_date,t.color,t.status,t.completed,
+                   t.completed_at,t.created_at,t.deleted_at,
+                   owner.display_name AS owner_name,
+                   COALESCE(assignee.display_name,owner.display_name,'삭제된 사용자') AS assignee_name
+            FROM todos t
+            LEFT JOIN users owner ON owner.id=t.owner_id
+            LEFT JOIN users assignee ON assignee.id=t.assignee_id
+            WHERE {where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+        """, params + [page_size, offset]).fetchall()
+
+    audit(request, user["id"], "KANBAN_COLUMN_VIEW",
+          status=status, owner_id=owner_id, result_count=len(rows), page=page)
     return {"items":[dict(row) for row in rows], "page":page,
             "page_size":page_size, "total":total,
             "total_pages":(total + page_size - 1) // page_size}
@@ -1437,6 +1493,8 @@ KANBAN_HTML = r'''<!doctype html>
 .completed-owner{font-size:11px;color:#59657b}
 .completed-pagination{display:flex;justify-content:center;align-items:center;gap:12px;margin-top:14px}
 .done-limit-note{font-size:10px;color:#8792a6;text-align:center;padding:4px 0}
+.view-column-items{width:100%;padding:8px;margin-top:2px;border:1px dashed #d6deeb;border-radius:8px;background:#f8faff;color:#52627e;font-size:10px}
+.view-column-items:hover{background:#edf3ff;color:#315fc5;border-color:#b9c9ed}
 @media(max-width:600px){.completed-item{grid-template-columns:1fr 1fr}.completed-item>div:first-child{grid-column:1/-1}.top-actions{flex-wrap:wrap}}
 .board-add{padding:12px;background:#fff;border:1px solid var(--line);border-radius:13px;box-shadow:0 3px 12px rgba(25,40,70,.035)}
 .board-add-row{display:flex;gap:9px;align-items:center}
@@ -1475,9 +1533,10 @@ body.modal-open{overflow:hidden}
 <div class="board-scroll"><div class="board" id="board"><div class="empty">보드를 불러오는 중...</div></div></div>
 </div><div class="modal" id="kanbanTodoEditModal" role="dialog" aria-modal="true" aria-labelledby="kanbanEditHeading"><div class="dialog"><div class="dialog-head"><h2 id="kanbanEditHeading">TODO 수정</h2><button type="button" class="close" data-close="kanbanTodoEditModal" aria-label="닫기">×</button></div><div class="edit-form"><div class="field"><label for="kanbanEditTitle">할 일 제목</label><input id="kanbanEditTitle" maxlength="200" placeholder="해야 할 일을 입력하세요"></div><div class="field"><label for="kanbanEditAssignee">담당자</label><select id="kanbanEditAssignee"></select></div><div class="field"><label for="kanbanEditDue">마감일</label><input id="kanbanEditDue" type="date"></div><div class="field"><label for="kanbanEditNote">비고</label><textarea id="kanbanEditNote" rows="4" maxlength="2000" placeholder="추가 설명이나 참고사항을 입력하세요"></textarea></div><div class="field"><label for="kanbanEditColor">카드 색상</label><div class="color-field"><span class="color-help">칸반 카드 왼쪽 강조 색상을 선택합니다.</span><input id="kanbanEditColor" type="color" value="#9aa7bd" aria-label="TODO 카드 색상"></div></div><div class="edit-actions"><button type="button" data-close="kanbanTodoEditModal">취소</button><button type="button" id="saveKanbanTodoEdit" class="primary">변경 저장</button></div></div></div></div>
 <div class="modal" id="completedModal" role="dialog" aria-modal="true" aria-labelledby="completedHeading"><div class="dialog completed-dialog"><div class="dialog-head"><div><h2 id="completedHeading">완료항목모음</h2><p class="completed-meta">사용자 구분 없이 완료된 TODO를 모아 확인합니다. 휴지통으로 이동한 완료 항목도 포함됩니다.</p></div><button type="button" class="close" id="closeCompleted" aria-label="닫기">×</button></div><div id="completedList" class="completed-list"><div class="empty">완료 항목을 불러오는 중...</div></div><div class="completed-pagination"><button type="button" id="completedPrev">이전</button><span id="completedPageInfo" class="completed-meta"></span><button type="button" id="completedNext">다음</button></div></div></div>
+<div class="modal" id="columnItemsModal" role="dialog" aria-modal="true" aria-labelledby="columnItemsHeading"><div class="dialog completed-dialog"><div class="dialog-head"><div><h2 id="columnItemsHeading">업무 전체 보기</h2><p id="columnItemsSubheading" class="completed-meta"></p></div><button type="button" class="close" id="closeColumnItems" aria-label="닫기">×</button></div><div id="columnItemsList" class="completed-list"><div class="empty">업무를 불러오는 중...</div></div><div class="completed-pagination"><button type="button" id="columnItemsPrev">이전</button><span id="columnItemsPageInfo" class="completed-meta"></span><button type="button" id="columnItemsNext">다음</button></div></div></div>
 <div class="toast" id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;let completedPage=1;let completedTotalPages=1;
+const $=id=>document.getElementById(id);let userId=localStorage.getItem('company-calendar-user');let draggedId=null;let completedPage=1;let completedTotalPages=1;let columnPage=1;let columnTotalPages=1;let columnStatus='todo';let columnOwner='';
 const statuses=[{id:'todo',label:'대기'},{id:'in_progress',label:'진행 중'},{id:'blocked',label:'보류됨'},{id:'done',label:'완료됨'},{id:'trash',label:'휴지통'}];let kanbanUsers=[];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function closeKanbanTodoEdit(){const modal=$('kanbanTodoEditModal');modal.classList.remove('is-open');document.body.classList.remove('modal-open')}
@@ -1486,6 +1545,11 @@ $('kanbanTodoEditModal').addEventListener('click',e=>{if(e.target===$('kanbanTod
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('kanbanTodoEditModal').classList.contains('is-open'))closeKanbanTodoEdit()});
 function toast(message){$('toast').textContent=message;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2500)}
 async function loadCompleted(page=1){completedPage=page;$('completedList').innerHTML='<div class="empty">완료 항목을 불러오는 중...</div>';try{const data=await api('/api/kanban/completed?page='+completedPage+'&page_size=20');completedTotalPages=Math.max(1,data.total_pages||1);$('completedList').innerHTML=data.items.length?data.items.map(t=>'<article class="completed-item"><div><div class="completed-title">'+esc(t.title)+'</div>'+(t.note?'<div class="completed-meta">'+esc(t.note)+'</div>':'')+'<div class="completed-meta">'+(t.deleted_at?'휴지통 보관':'완료')+' · '+esc((t.completed_at||t.created_at||'').replace('T',' '))+'</div></div><div class="completed-owner">등록: '+esc(t.owner_name||'삭제된 사용자')+'</div><div class="completed-owner">담당: '+esc(t.assignee_name||'삭제된 사용자')+'</div></article>').join(''):'<div class="empty">완료된 TODO가 없습니다.</div>';$('completedPageInfo').textContent=data.total+'건 · '+completedPage+' / '+completedTotalPages+' 페이지;$('completedPrev').disabled=completedPage<=1;$('completedNext').disabled=completedPage>=completedTotalPages}catch(e){$('completedList').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+async function loadColumnItems(page=1){columnPage=page;$('columnItemsList').innerHTML='<div class="empty">업무를 불러오는 중...</div>';try{const params=new URLSearchParams({status:columnStatus,owner_id:columnOwner,page:String(columnPage),page_size:'20'});const data=await api('/api/kanban/items?'+params.toString());columnTotalPages=Math.max(1,data.total_pages||1);const statusLabel=statuses.find(s=>s.id===columnStatus)?.label||columnStatus;const memberName=kanbanUsers.find(u=>u.id===columnOwner)?.display_name||'담당자';$('columnItemsHeading').textContent=memberName+' · '+statusLabel;$('columnItemsSubheading').textContent='전체 '+data.total+'건 · 최신 항목부터 표시';$('columnItemsList').innerHTML=data.items.length?data.items.map(t=>'<article class="completed-item"><div><div class="completed-title">'+esc(t.title)+'</div>'+(t.note?'<div class="completed-meta">'+esc(t.note)+'</div>':'')+'<div class="completed-meta">'+(t.deleted_at?'휴지통 이동':'등록')+' · '+esc((t.deleted_at||t.created_at||'').replace('T',' '))+(t.due_date?' · 마감 '+esc(t.due_date):'')+'</div></div><div class="completed-owner">등록: '+esc(t.owner_name||'삭제된 사용자')+'</div><div class="completed-owner">담당: '+esc(t.assignee_name||'삭제된 사용자')+'</div></article>').join(''):'<div class="empty">표시할 업무가 없습니다.</div>';$('columnItemsPageInfo').textContent=data.total+'건 · '+columnPage+' / '+columnTotalPages+' 페이지';$('columnItemsPrev').disabled=columnPage<=1;$('columnItemsNext').disabled=columnPage>=columnTotalPages}catch(e){$('columnItemsList').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
+function openColumnItems(status,ownerId){columnStatus=status;columnOwner=ownerId;$('columnItemsModal').classList.add('is-open');document.body.classList.add('modal-open');loadColumnItems(1)}
+function closeColumnItems(){$('columnItemsModal').classList.remove('is-open');document.body.classList.remove('modal-open')}
+$('closeColumnItems').onclick=closeColumnItems;$('columnItemsModal').addEventListener('click',e=>{if(e.target===$('columnItemsModal'))closeColumnItems()});$('columnItemsPrev').onclick=()=>loadColumnItems(columnPage-1);$('columnItemsNext').onclick=()=>loadColumnItems(columnPage+1);
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('columnItemsModal').classList.contains('is-open'))closeColumnItems()});
 function openCompleted(){ $('completedModal').classList.add('is-open');document.body.classList.add('modal-open');loadCompleted(1)}
 function closeCompleted(){ $('completedModal').classList.remove('is-open');document.body.classList.remove('modal-open')}
 $('showCompleted').onclick=openCompleted;$('closeCompleted').onclick=closeCompleted;$('completedModal').addEventListener('click',e=>{if(e.target===$('completedModal'))closeCompleted()});$('completedPrev').onclick=()=>loadCompleted(completedPage-1);$('completedNext').onclick=()=>loadCompleted(completedPage+1);
@@ -1499,9 +1563,10 @@ function openKanbanTodoEdit(id){const t=kanbanTodos.find(x=>x.id===id);if(!t)ret
 $('saveKanbanTodoEdit').onclick=async()=>{try{const id=Number($('saveKanbanTodoEdit').dataset.todoId),title=$('kanbanEditTitle').value.trim();if(!title)throw Error('TODO 제목을 입력하세요.');await api('/api/todos/'+id,{method:'PUT',body:JSON.stringify({title,due_date:$('kanbanEditDue').value||null,note:$('kanbanEditNote').value,assignee_id:$('kanbanEditAssignee').value,visibility:'shared',color:$('kanbanEditColor').value})});closeKanbanTodoEdit();await load();toast('TODO를 수정했습니다.')}catch(e){toast(e.message)}};
 function render(data){kanbanTodos=data.todos;const board=$('board');let html='<div class="board-head"><div>담당자</div>'+statuses.map(s=>'<div>'+s.label+' <span class="status-count">'+data.todos.filter(t=>t.status===s.id).length+'</span></div>').join('')+'</div>';
  for(const member of data.users){const memberTodos=data.todos.filter(t=>t.assignee_id===member.id);html+='<div class="board-row"><div class="member"><div>'+esc(member.display_name)+'<span class="member-count">'+memberTodos.length+'개 업무</span></div></div>';
- for(const status of statuses){const allItems=memberTodos.filter(t=>t.status===status.id);const items=status.id==='done'?allItems.slice().sort((a,b)=>String(b.completed_at||b.created_at||'').localeCompare(String(a.completed_at||a.created_at||''))).slice(0,10):allItems;html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" style="border-left-color:'+esc(/^#[0-9a-fA-F]{6}$/.test(t.color||'')?t.color:'#9aa7bd')+'" draggable="true" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div><button type="button" class="edit-kanban-todo" data-edit-todo="'+t.id+'" aria-label="TODO 수정" title="TODO 수정">✎</button></article>').join('')+(status.id==='done'&&allItems.length>10?'<div class="done-limit-note">최근 10건 표시 · 나머지는 상단 완료항목모음에서 확인</div>':''):'<div class="empty">업무 없음</div>')+'</div>'}
+ for(const status of statuses){const allItems=memberTodos.filter(t=>t.status===status.id);const sortedItems=allItems.slice().sort((a,b)=>{const av=status.id==='done'?(a.completed_at||a.created_at):status.id==='trash'?(a.deleted_at||a.created_at):a.created_at;const bv=status.id==='done'?(b.completed_at||b.created_at):status.id==='trash'?(b.deleted_at||b.created_at):b.created_at;return String(bv||'').localeCompare(String(av||''))});const items=sortedItems.slice(0,10);html+='<div class="dropzone" data-owner="'+esc(member.id)+'" data-status="'+status.id+'">'+(items.length?items.map(t=>'<article class="task" style="border-left-color:'+esc(/^#[0-9a-fA-F]{6}$/.test(t.color||'')?t.color:'#9aa7bd')+'" draggable="'+(status.id==='trash'?'false':'true')+'" data-todo="'+t.id+'"><div class="task-title">'+esc(t.title)+'</div>'+(t.note?'<div class="task-meta">'+esc(t.note)+'</div>':'')+'<div class="task-meta"><span>'+(t.due_date?'마감 '+esc(t.due_date):'마감일 없음')+'</span></div><button type="button" class="edit-kanban-todo" data-edit-todo="'+t.id+'" aria-label="TODO 수정" title="TODO 수정">✎</button></article>').join('')+(allItems.length>10?'<button type="button" class="view-column-items" data-view-items="'+status.id+'" data-owner="'+esc(member.id)+'">전체 보기 ('+allItems.length+')</button>':''):'<div class="empty">업무 없음</div>')+'</div>'}
  html+='</div>'}board.innerHTML=html;
 board.querySelectorAll('[data-edit-todo]').forEach(button=>button.addEventListener('click',e=>{e.stopPropagation();openKanbanTodoEdit(Number(button.dataset.editTodo))}));
+board.querySelectorAll('[data-view-items]').forEach(button=>button.addEventListener('click',e=>{e.stopPropagation();openColumnItems(button.dataset.viewItems,button.dataset.owner)}));
 board.querySelectorAll('.task').forEach(card=>{card.addEventListener('dragstart',e=>{draggedId=Number(card.dataset.todo);e.dataTransfer.setData('text/plain',String(draggedId));e.dataTransfer.effectAllowed='move'});card.addEventListener('dragend',()=>{draggedId=null;board.querySelectorAll('.drag-over').forEach(el=>el.classList.remove('drag-over'))})});
 board.querySelectorAll('.dropzone').forEach(zone=>{zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag-over');e.dataTransfer.dropEffect='move'});zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag-over')});zone.addEventListener('drop',async e=>{e.preventDefault();zone.classList.remove('drag-over');const id=draggedId||Number(e.dataTransfer.getData('text/plain'));if(!id)return;if(zone.dataset.status==='trash'&&!confirm('이 TODO를 휴지통으로 이동할까요?\n메인 TODO 목록에서 숨겨지며 관리자 페이지에서 복구할 수 있습니다.'))return;try{await api('/api/kanban/todos/'+id,{method:'PATCH',body:JSON.stringify({owner_id:zone.dataset.owner,status:zone.dataset.status})});await load();toast(zone.dataset.status==='trash'?'TODO를 휴지통으로 이동했습니다.':'업무 상태를 변경했습니다.')}catch(err){toast(err.message)}})});
 }
