@@ -1,217 +1,54 @@
 # Team Calendar
 
-**Team Calendar**는 팀의 일정과 업무를 한곳에서 공유하기 위한 사내 공용 캘린더입니다.
+A lightweight internal web application for sharing team schedules, to-dos, work items, and related documents.
 
-## 만들게 된 이유
+## Features
 
-팀 일정을 메신저 대화방에 남기거나 각자 사용하는 PC의 개인 캘린더에 따로 관리하다 보니, 일정이 여러 곳으로 흩어지고 누가 어떤 일정을 등록했는지 서로 확인하기 어려웠습니다. 메신저에서는 일정이 대화에 묻히고, 개인 캘린더는 다른 구성원이 일정을 한눈에 확인하기 어렵습니다.
+### Calendar and events
+- Monthly and weekly calendar views
+- Create and edit shared or personal events
+- Event categories such as SR, CM, meetings, leave, and other
+- Optional environment, assignee, and ticket information for work-related events
+- Comments and file attachments
 
-이런 불편을 줄이기 위해 팀원들이 하나의 캘린더에서 일정을 함께 등록하고 확인할 수 있는 간단한 사내 일정 관리 도구를 만들었습니다. 회원가입 절차 대신 브라우저 식별자와 IP 정보를 이용해 사용자를 구분하고, 일정·Todo·작업 정보를 공용으로 관리하는 것을 목표로 합니다.
+### To-dos and work tracking
+- Personal and shared to-dos
+- Due dates, priorities, assignees, notes, and status
+- Kanban-style task overview and list pagination
+- Search and filters for day-to-day work
 
-## 주요 기능
+### Administration
+- User and schedule management
+- Activity history and deleted-item review
+- Recovery of supported deleted records
 
-### 캘린더
-- 월간 / 주간 일정 보기
-- 날짜를 클릭해 해당 날짜의 전체 일정 확인 및 새 일정 등록
-- 일정이 많은 날짜는 `더보기`로 전체 목록 확인
-- 주간 화면은 종일, 07:00~21:00 시간대, 그 외 시간으로 구분
-- 여러 날짜에 걸친 일정 표시
-- 일정 등록 / 수정 / 삭제 및 첨부파일 업로드
-- 일정별 댓글 작성, 수정, 삭제 (작성자 본인 댓글만 수정·삭제)
+## Technology
 
-### 일정 유형 및 작업 정보
-- 일정 유형: `SR`, `CM`, `회의`, `휴가`, `기타`
-- `SR` / `CM` 선택 시 환경(`Dev`, `Stg`, `Prd`) 필수
-- `SR` / `CM`에서 담당자와 작업번호 선택 입력
-- 작업계획서 등 여러 파일 첨부 가능
-- 자연어 일정 등록 예: `다음 주 수요일 오후 2시부터 3시까지 정기회의`
-- 오전/오후를 생략한 1~11시는 오후 시간으로 해석
-- 일정 검색: 제목, 설명, 담당자, 작업번호, 유형, 환경 및 날짜 범위
-
-### Todo
-- 개인 / 공용 Todo 등록
-- 마감일, 담당자, 비고 설정 및 TODO 수정
-- 메인 TODO 목록 페이지네이션
-- TODO 제목 입력 후 Enter로 빠른 등록
-- 진행 중 / 완료 필터
-- 칸반 화면에서 공용 TODO 바로 추가
-- 공용 Todo의 담당자별 칸반 보드 (대기 / 진행 중 / 보류됨 / 완료됨 / 휴지통)
-- 칸반 드래그 앤 드롭으로 담당자 및 진행 단계 변경
-- 칸반 완료 상태를 메인 Todo와 동기화
-- 휴지통으로 이동한 Todo는 메인 화면에서 숨기고 관리자 페이지에서 복구 가능
-- 완료 처리 및 수동 삭제
-
-### 관리자
-- 관리자 토큰 인증 기반 별도 관리자 페이지 (`/admin`)
-- 사용자 계정 비활성화 및 복구
-- 사용자, 일정, Todo, 댓글, 첨부파일 메타데이터, 활동 로그 조회
-- 삭제된 일정과 Todo 이력 조회 및 복구
-- DB 테이블은 읽기 전용으로 조회하며 직접 수정 기능은 제공하지 않음
-
-### 사용자 및 기록
-- 브라우저 UUID와 접속 IP를 활용한 간편 사용자 식별
-- 최초 접속 시 표시 이름 필수 입력
-- 사용자 표시 이름 변경
-- 주요 작업을 콘솔, 파일 로그, SQLite 활동 로그에 기록
-
-## 기술 스택
-
-| 영역 | 기술 |
-|---|---|
-| Backend | Python 3.11+, FastAPI |
-| ASGI Server | Uvicorn |
-| Package / Virtual Environment | uv |
+| Area | Stack |
+| --- | --- |
+| Backend | Python, FastAPI |
 | Database | SQLite |
-| Frontend | HTML, CSS, Vanilla JavaScript |
+| Templates | Jinja2 |
+| Runtime | uv, Uvicorn |
+| Frontend | HTML, CSS, JavaScript |
 
-프론트엔드 리소스는 애플리케이션 내부에 포함되어 외부 CDN을 사용하지 않습니다. 사내망 또는 인터넷 연결이 제한된 환경을 고려한 단일 서버 구조입니다.
+## Run locally
 
-## 실행 방법
+Requirements: Python 3.11 or later and uv.
 
-### 사전 준비
-- Python 3.11 이상
-- [uv](https://docs.astral.sh/uv/) 설치
+    git clone https://github.com/BaeDoge/python-share-calender.git
+    cd python-share-calender
+    uv sync
+    uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-프로젝트 루트 디렉터리에서 실행합니다.
+Open http://127.0.0.1:8000.
 
-```powershell
-uv sync
-```
+To make the application available to other machines on a trusted network, configure the host and network access according to your environment. Do not expose it publicly without additional security controls.
 
-### 서버 실행
+## Data storage
 
-```powershell
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
+The application stores its SQLite database, attachments, and related runtime data under the project data directory. Back up this directory regularly and protect it from unauthorised access.
 
-개발 중 코드 변경 시 자동 재시작하려면 다음 명령을 사용합니다.
+## Security considerations
 
-```powershell
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-브라우저에서 아래 주소로 접속합니다.
-
-```text
-http://localhost:8000
-http://<서버 IP>:8000
-```
-
-서버를 종료할 때는 실행 중인 터미널에서 `Ctrl+C`를 누릅니다.
-
-## 프로젝트 구조
-
-```text
-company-calendar/
-├── app/
-│   ├── __init__.py
-│   └── main.py             # FastAPI API 및 웹 화면
-├── data/
-│   ├── calendar.db         # SQLite 데이터베이스 (최초 실행 시 생성)
-│   └── uploads/            # 일정 첨부파일
-├── logs/
-│   └── activity.log        # 활동 로그 (최초 실행 시 생성)
-├── .gitignore
-├── .python-version
-├── pyproject.toml
-└── README.md
-```
-
-## 데이터 및 로그 위치
-
-| 경로 | 내용 |
-|---|---|
-| `data/calendar.db` | 사용자, 일정, Todo, 첨부파일 메타데이터, 활동 로그 |
-| `data/uploads/` | 일정에 첨부한 실제 파일 |
-| `logs/activity.log` | 작업 로그 파일 |
-
-기본 로그는 5MB 단위로 회전하며 최대 5개 백업본을 유지합니다. 데이터·로그 경로는 환경변수로 변경할 수 있습니다.
-
-```powershell
-$env:CALENDAR_DATA_DIR="D:\CompanyCalendarData"
-$env:CALENDAR_LOG_DIR="D:\CompanyCalendarLogs"
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-## 기존 데이터 백업 및 업데이트
-
-버전을 교체하기 전에는 서버를 종료하고 `data/calendar.db`, `data/uploads/`, 필요한 로그 파일을 별도 위치에 백업하세요. 새 버전을 설치한 후 기존 데이터베이스와 업로드 폴더를 새 프로젝트의 `data/`에 복사합니다. 기존 DB를 새 빈 DB로 덮어쓰지 않도록 주의합니다.
-
-## 관리자 페이지 설정
-
-관리자 페이지를 사용하려면 서버 실행 환경에 `CALENDAR_ADMIN_TOKEN`을 설정해야 합니다. 토큰은 소스코드나 저장소에 기록하지 말고 운영자가 별도로 생성·보관하세요.
-
-PowerShell 예시:
-
-```powershell
-$env:CALENDAR_ADMIN_TOKEN="긴 무작위 관리자 토큰"
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-브라우저에서 `/admin`에 접속해 동일한 토큰으로 인증합니다. 토큰은 현재 브라우저 탭의 세션 저장소에만 유지됩니다. 관리자 페이지의 DB 조회는 읽기 전용이며, 삭제 이력 복구만 별도 기능으로 제공합니다. 관리자 페이지도 사내 신뢰 네트워크에서만 접근하도록 운영하세요.
-
-## 사내망 운영 시 유의사항
-
-- IP + 브라우저 UUID는 사용자를 편리하게 구분하기 위한 식별 방식이며, 비밀번호 기반 인증이나 사내 SSO를 대체하지 않습니다.
-- 로그인 없이 일정과 Todo가 공유되므로 신뢰할 수 있는 사내 네트워크에서만 운영해야 합니다.
-- 현재 앱은 기본적으로 서버가 직접 관찰한 접속 IP를 기록합니다. 프록시 뒤에서 실행하면 프록시 IP가 표시될 수 있으므로 실제 사용자 IP가 필요하면 신뢰할 수 있는 프록시 전달 헤더 처리를 별도로 구성해야 합니다.
-- 첨부파일에는 업무상 민감한 정보가 포함될 수 있으므로 사내 보안 정책에 맞는 접근 통제와 백업 정책을 적용해야 합니다.
-- SQLite는 소규모 팀의 경량 운영에 적합합니다. 동시 쓰기 부하나 사용자가 크게 늘어나면 PostgreSQL 전환을 검토하세요.
-- 사내 다른 PC에서 접속하려면 서버의 8000번 포트에 대한 네트워크 및 방화벽 접근이 허용되어야 합니다.
-- 폐쇄망에서 `uv sync`를 수행하려면 패키지가 uv 캐시에 있거나 사내 PyPI/Nexus 또는 사전 준비한 wheelhouse를 사용할 수 있어야 합니다.
-
-## 버전 0.6.1 변경 사항
-
-- 칸반 TODO 수정 창을 화면 최상단 모달로 표시하도록 수정
-- 큰 수정 버튼을 작은 연필 아이콘으로 변경
-- 칸반 TODO 추가/수정 폼의 CSS 개선
-- TODO 카드별 색상 선택 기능 추가 (기존 DB 데이터 자동 마이그레이션)
-
-## 버전 0.6.0 변경 사항
-
-- 칸반 카드에서 공용 TODO 수정 (제목, 담당자, 마감일, 비고)
-- 메인 TODO 등록 시 담당자 입력 제거 및 본인 자동 지정
-- 칸반 TODO 빠른 등록은 제목만 입력, 나머지는 편집으로 입력
-- TODO 공개 범위 기본값을 공용으로 변경
-- 캘린더 아래에 본인 기준 오늘 해야 할 일정과 진행 중 TODO 표시 (휴가 일정 제외)
-- `scripts/maintenance_archive.py`로 3개월 이전 데이터 ZIP 백업 및 현 DB 정리
-- 백업 ZIP에 정리 전 SQLite DB와 첨부파일 원본 포함
-
-## 버전 0.5.0 변경 사항
-
-- 관리자 페이지에서 사용자 계정 비활성화 및 복구 지원 (기존 작성 이력 보존)
-- TODO 제목, 담당자, 마감일, 공개 범위, 비고 수정
-- 메인 TODO 목록 페이지네이션 및 Enter 키 빠른 등록
-- 칸반 화면에서 TODO를 바로 추가하고 담당자 지정
-- 우선순위 UI 제거, 담당자 및 비고 중심으로 변경
-- 최초 접속 시 사용자 이름 필수 입력
-- 사용자 이름이 '관리자'인 계정은 칸반 보드와 담당자 선택 목록에서 제외
-- 기존 SQLite DB에 users.deleted_at, todos.note 컬럼을 자동 추가
-
-## 버전 0.4.0 변경 사항
-
-- 일정 카테고리별 색상을 일정 카드, 월간·주간 화면, 상세 및 검색 결과에 적용
-- 칸반에 보류됨 단계 추가
-- 칸반 휴지통 드롭으로 Todo를 소프트 삭제하고 관리자 페이지에서 복구 가능
-- 일정 삭제도 소프트 삭제로 변경해 댓글과 첨부파일을 포함한 기존 이력 보존
-- 관리자 토큰 인증 및 DB 테이블 조회, 작업 이력 화면 추가
-
-## 버전 0.3.0 변경 사항
-
-- 일정 댓글 기능 추가
-- 공용 Todo를 사용자별 행과 대기 / 진행 중 / 완료 열로 보여주는 칸반 보드 추가
-- 칸반에서 담당자 및 상태 변경 가능
-- 칸반의 완료 상태를 기존 메인 Todo의 완료 여부와 동기화
-- 기존 DB의 Todo 데이터는 유지하면서 상태 및 담당자 필드를 자동 마이그레이션
-
-## 향후 개선 후보
-
-- 일정 시작 10분 전 PC 시스템 알림
-- 반복 일정 및 일정 변경 이력
-- SR / CM 작업 상태와 진행 이력
-- 사내 인증(SSO) 및 사용자 권한 관리
-- 관리자용 사용자·일정 관리 화면
-
-## License
-
-라이선스는 별도로 지정하지 않았습니다. 공개 저장소로 배포하기 전에 조직의 소스코드 공개 및 라이선스 정책을 확인하세요.
+The current user identification flow uses a browser-generated identifier and connection IP information rather than a full account-based authentication system. It is intended for a trusted internal environment. A public or organisation-wide deployment should add appropriate authentication, authorisation, HTTPS, backup, and data-retention controls.
